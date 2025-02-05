@@ -16,15 +16,22 @@
 #
 
 import sys
+from typing import Optional, Tuple, TYPE_CHECKING
 
-from pyspark import since, SparkContext
+from pyspark import since
 from pyspark.ml.common import _java2py, _py2java
+from pyspark.ml.linalg import Matrix, Vector
 from pyspark.ml.wrapper import JavaWrapper, _jvm
-from pyspark.sql.column import Column, _to_seq
+from pyspark.sql.column import Column
+from pyspark.sql.dataframe import DataFrame
 from pyspark.sql.functions import lit
+from pyspark.sql.utils import is_remote
+
+if TYPE_CHECKING:
+    from py4j.java_gateway import JavaObject
 
 
-class ChiSquareTest(object):
+class ChiSquareTest:
     """
     Conduct Pearson's independence test for every feature against the label. For each feature,
     the (feature, label) pairs are converted into a contingency matrix for which the Chi-squared
@@ -37,7 +44,9 @@ class ChiSquareTest(object):
     """
 
     @staticmethod
-    def test(dataset, featuresCol, labelCol, flatten=False):
+    def test(
+        dataset: DataFrame, featuresCol: str, labelCol: str, flatten: bool = False
+    ) -> DataFrame:
         """
         Perform a Pearson's independence test using dataset.
 
@@ -94,13 +103,31 @@ class ChiSquareTest(object):
         >>> row[0].statistic
         4.0
         """
-        sc = SparkContext._active_spark_context
-        javaTestObj = _jvm().org.apache.spark.ml.stat.ChiSquareTest
-        args = [_py2java(sc, arg) for arg in (dataset, featuresCol, labelCol, flatten)]
-        return _java2py(sc, javaTestObj.test(*args))
+        if is_remote():
+            from pyspark.ml.wrapper import JavaTransformer
+            from pyspark.ml.connect.serialize import serialize_ml_params_values
+
+            instance = JavaTransformer()
+            instance._java_obj = "org.apache.spark.ml.stat.ChiSquareTestWrapper"
+            serialized_ml_params = serialize_ml_params_values(
+                {"featuresCol": featuresCol, "labelCol": labelCol, "flatten": flatten},
+                dataset.sparkSession.client,  # type: ignore[arg-type,operator]
+            )
+            instance._serialized_ml_params = serialized_ml_params  # type: ignore[attr-defined]
+            return instance.transform(dataset)
+
+        else:
+            from pyspark.core.context import SparkContext
+
+            sc = SparkContext._active_spark_context
+            assert sc is not None
+
+            javaTestObj = getattr(_jvm(), "org.apache.spark.ml.stat.ChiSquareTest")
+            args = [_py2java(sc, arg) for arg in (dataset, featuresCol, labelCol, flatten)]
+            return _java2py(sc, javaTestObj.test(*args))
 
 
-class Correlation(object):
+class Correlation:
     """
     Compute the correlation matrix for the input dataset of Vectors using the specified method.
     Methods currently supported: `pearson` (default), `spearman`.
@@ -116,7 +143,7 @@ class Correlation(object):
     """
 
     @staticmethod
-    def corr(dataset, column, method="pearson"):
+    def corr(dataset: DataFrame, column: str, method: str = "pearson") -> DataFrame:
         """
         Compute the correlation matrix with specified method using dataset.
 
@@ -161,13 +188,31 @@ class Correlation(object):
                      [        NaN,         NaN,  1.        ,         NaN],
                      [ 0.4       ,  0.9486... ,         NaN,  1.        ]])
         """
-        sc = SparkContext._active_spark_context
-        javaCorrObj = _jvm().org.apache.spark.ml.stat.Correlation
-        args = [_py2java(sc, arg) for arg in (dataset, column, method)]
-        return _java2py(sc, javaCorrObj.corr(*args))
+        if is_remote():
+            from pyspark.ml.wrapper import JavaTransformer
+            from pyspark.ml.connect.serialize import serialize_ml_params_values
+
+            instance = JavaTransformer()
+            instance._java_obj = "org.apache.spark.ml.stat.CorrelationWrapper"
+            serialized_ml_params = serialize_ml_params_values(
+                {"featuresCol": column, "method": method},
+                dataset.sparkSession.client,  # type: ignore[arg-type,operator]
+            )
+            instance._serialized_ml_params = serialized_ml_params  # type: ignore[attr-defined]
+            return instance.transform(dataset)
+
+        else:
+            from pyspark.core.context import SparkContext
+
+            sc = SparkContext._active_spark_context
+            assert sc is not None
+
+            javaCorrObj = getattr(_jvm(), "org.apache.spark.ml.stat.Correlation")
+            args = [_py2java(sc, arg) for arg in (dataset, column, method)]
+            return _java2py(sc, javaCorrObj.corr(*args))
 
 
-class KolmogorovSmirnovTest(object):
+class KolmogorovSmirnovTest:
     """
     Conduct the two-sided Kolmogorov Smirnov (KS) test for data sampled from a continuous
     distribution.
@@ -181,7 +226,7 @@ class KolmogorovSmirnovTest(object):
     """
 
     @staticmethod
-    def test(dataset, sampleCol, distName, *params):
+    def test(dataset: DataFrame, sampleCol: str, distName: str, *params: float) -> DataFrame:
         """
         Conduct a one-sample, two-sided Kolmogorov-Smirnov test for probability distribution
         equality. Currently supports the normal distribution, taking as parameters the mean and
@@ -227,16 +272,40 @@ class KolmogorovSmirnovTest(object):
         >>> round(ksResult.statistic, 3)
         0.175
         """
-        sc = SparkContext._active_spark_context
-        javaTestObj = _jvm().org.apache.spark.ml.stat.KolmogorovSmirnovTest
-        dataset = _py2java(sc, dataset)
-        params = [float(param) for param in params]
-        return _java2py(
-            sc, javaTestObj.test(dataset, sampleCol, distName, _jvm().PythonUtils.toSeq(params))
-        )
+        if is_remote():
+            from pyspark.ml.wrapper import JavaTransformer
+            from pyspark.ml.connect.serialize import serialize_ml_params_values
+
+            instance = JavaTransformer()
+            instance._java_obj = "org.apache.spark.ml.stat.KolmogorovSmirnovTestWrapper"
+            serialized_ml_params = serialize_ml_params_values(
+                {"inputCol": sampleCol, "distName": distName, "paramsArray": list(params)},
+                dataset.sparkSession.client,  # type: ignore[arg-type,operator]
+            )
+            instance._serialized_ml_params = serialized_ml_params  # type: ignore[attr-defined]
+            return instance.transform(dataset)
+
+        else:
+            from pyspark.core.context import SparkContext
+
+            sc = SparkContext._active_spark_context
+            assert sc is not None
+
+            javaTestObj = getattr(_jvm(), "org.apache.spark.ml.stat.KolmogorovSmirnovTest")
+            dataset = _py2java(sc, dataset)
+            params = [float(param) for param in params]  # type: ignore[assignment]
+            return _java2py(
+                sc,
+                javaTestObj.test(
+                    dataset,
+                    sampleCol,
+                    distName,
+                    _jvm().PythonUtils.toSeq(params),
+                ),
+            )
 
 
-class Summarizer(object):
+class Summarizer:
     """
     Tools for vectorized statistics on MLlib Vectors.
     The methods in this package provide various statistics for Vectors contained inside DataFrames.
@@ -258,33 +327,29 @@ class Summarizer(object):
     +-----------------------------------+
     |{[1.0,1.0,1.0], 1}                 |
     +-----------------------------------+
-    <BLANKLINE>
     >>> df.select(summarizer.summary(df.features)).show(truncate=False)
     +--------------------------------+
     |aggregate_metrics(features, 1.0)|
     +--------------------------------+
     |{[1.0,1.5,2.0], 2}              |
     +--------------------------------+
-    <BLANKLINE>
     >>> df.select(Summarizer.mean(df.features, df.weight)).show(truncate=False)
     +--------------+
     |mean(features)|
     +--------------+
     |[1.0,1.0,1.0] |
     +--------------+
-    <BLANKLINE>
     >>> df.select(Summarizer.mean(df.features)).show(truncate=False)
     +--------------+
     |mean(features)|
     +--------------+
     |[1.0,1.5,2.0] |
     +--------------+
-    <BLANKLINE>
     """
 
     @staticmethod
     @since("2.4.0")
-    def mean(col, weightCol=None):
+    def mean(col: Column, weightCol: Optional[Column] = None) -> Column:
         """
         return a column of mean summary
         """
@@ -292,7 +357,7 @@ class Summarizer(object):
 
     @staticmethod
     @since("3.0.0")
-    def sum(col, weightCol=None):
+    def sum(col: Column, weightCol: Optional[Column] = None) -> Column:
         """
         return a column of sum summary
         """
@@ -300,7 +365,7 @@ class Summarizer(object):
 
     @staticmethod
     @since("2.4.0")
-    def variance(col, weightCol=None):
+    def variance(col: Column, weightCol: Optional[Column] = None) -> Column:
         """
         return a column of variance summary
         """
@@ -308,7 +373,7 @@ class Summarizer(object):
 
     @staticmethod
     @since("3.0.0")
-    def std(col, weightCol=None):
+    def std(col: Column, weightCol: Optional[Column] = None) -> Column:
         """
         return a column of std summary
         """
@@ -316,7 +381,7 @@ class Summarizer(object):
 
     @staticmethod
     @since("2.4.0")
-    def count(col, weightCol=None):
+    def count(col: Column, weightCol: Optional[Column] = None) -> Column:
         """
         return a column of count summary
         """
@@ -324,7 +389,7 @@ class Summarizer(object):
 
     @staticmethod
     @since("2.4.0")
-    def numNonZeros(col, weightCol=None):
+    def numNonZeros(col: Column, weightCol: Optional[Column] = None) -> Column:
         """
         return a column of numNonZero summary
         """
@@ -332,7 +397,7 @@ class Summarizer(object):
 
     @staticmethod
     @since("2.4.0")
-    def max(col, weightCol=None):
+    def max(col: Column, weightCol: Optional[Column] = None) -> Column:
         """
         return a column of max summary
         """
@@ -340,7 +405,7 @@ class Summarizer(object):
 
     @staticmethod
     @since("2.4.0")
-    def min(col, weightCol=None):
+    def min(col: Column, weightCol: Optional[Column] = None) -> Column:
         """
         return a column of min summary
         """
@@ -348,7 +413,7 @@ class Summarizer(object):
 
     @staticmethod
     @since("2.4.0")
-    def normL1(col, weightCol=None):
+    def normL1(col: Column, weightCol: Optional[Column] = None) -> Column:
         """
         return a column of normL1 summary
         """
@@ -356,14 +421,14 @@ class Summarizer(object):
 
     @staticmethod
     @since("2.4.0")
-    def normL2(col, weightCol=None):
+    def normL2(col: Column, weightCol: Optional[Column] = None) -> Column:
         """
         return a column of normL2 summary
         """
         return Summarizer._get_single_metric(col, weightCol, "normL2")
 
     @staticmethod
-    def _check_param(featuresCol, weightCol):
+    def _check_param(featuresCol: Column, weightCol: Optional[Column]) -> Tuple[Column, Column]:
         if weightCol is None:
             weightCol = lit(1.0)
         if not isinstance(featuresCol, Column) or not isinstance(weightCol, Column):
@@ -371,7 +436,7 @@ class Summarizer(object):
         return featuresCol, weightCol
 
     @staticmethod
-    def _get_single_metric(col, weightCol, metric):
+    def _get_single_metric(col: Column, weightCol: Optional[Column], metric: str) -> Column:
         col, weightCol = Summarizer._check_param(col, weightCol)
         return Column(
             JavaWrapper._new_java_obj(
@@ -380,7 +445,7 @@ class Summarizer(object):
         )
 
     @staticmethod
-    def metrics(*metrics):
+    def metrics(*metrics: str) -> "SummaryBuilder":
         """
         Given a list of metrics, provides a builder that it turns computes metrics from a column.
 
@@ -389,8 +454,8 @@ class Summarizer(object):
         The following metrics are accepted (case sensitive):
          - mean: a vector that contains the coefficient-wise mean.
          - sum: a vector that contains the coefficient-wise sum.
-         - variance: a vector tha contains the coefficient-wise variance.
-         - std: a vector tha contains the coefficient-wise standard deviation.
+         - variance: a vector that contains the coefficient-wise variance.
+         - std: a vector that contains the coefficient-wise standard deviation.
          - count: the count of all vectors seen.
          - numNonzeros: a vector with the number of non-zeros for each coefficients
          - max: the maximum for each coefficient.
@@ -414,7 +479,12 @@ class Summarizer(object):
         -------
         :py:class:`pyspark.ml.stat.SummaryBuilder`
         """
+        from pyspark.core.context import SparkContext
+        from pyspark.sql.classic.column import _to_seq
+
         sc = SparkContext._active_spark_context
+        assert sc is not None
+
         js = JavaWrapper._new_java_obj(
             "org.apache.spark.ml.stat.Summarizer.metrics", _to_seq(sc, metrics)
         )
@@ -432,10 +502,10 @@ class SummaryBuilder(JavaWrapper):
 
     """
 
-    def __init__(self, jSummaryBuilder):
+    def __init__(self, jSummaryBuilder: "JavaObject"):
         super(SummaryBuilder, self).__init__(jSummaryBuilder)
 
-    def summary(self, featuresCol, weightCol=None):
+    def summary(self, featuresCol: Column, weightCol: Optional[Column] = None) -> Column:
         """
         Returns an aggregate object that contains the summary of the column with the requested
         metrics.
@@ -456,10 +526,12 @@ class SummaryBuilder(JavaWrapper):
             structure is determined during the creation of the builder.
         """
         featuresCol, weightCol = Summarizer._check_param(featuresCol, weightCol)
+        assert self._java_obj is not None
+
         return Column(self._java_obj.summary(featuresCol._jc, weightCol._jc))
 
 
-class MultivariateGaussian(object):
+class MultivariateGaussian:
     """Represents a (mean, cov) tuple
 
     .. versionadded:: 3.0.0
@@ -474,7 +546,7 @@ class MultivariateGaussian(object):
            [ 3.,  2.]]))
     """
 
-    def __init__(self, mean, cov):
+    def __init__(self, mean: Vector, cov: Matrix):
         self.mean = mean
         self.cov = cov
 
@@ -499,7 +571,9 @@ if __name__ == "__main__":
     globs["sc"] = sc
     globs["spark"] = spark
 
-    failure_count, test_count = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
+    failure_count, test_count = doctest.testmod(
+        globs=globs, optionflags=doctest.ELLIPSIS | doctest.NORMALIZE_WHITESPACE
+    )
     spark.stop()
     if failure_count:
         sys.exit(-1)

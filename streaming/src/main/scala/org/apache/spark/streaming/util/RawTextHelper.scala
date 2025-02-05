@@ -47,11 +47,11 @@ object RawTextHelper {
           i += 1
         }
       }
-      map.toIterator.map {
+      map.iterator.map {
         case (k, v) => (k, v)
       }
     }
-    map.toIterator.map{case (k, v) => (k, v)}
+    map.iterator.map{case (k, v) => (k, v)}
   }
 
   /**
@@ -67,7 +67,7 @@ object RawTextHelper {
     var swap: (String, Long) = null
     var count = 0
 
-    while(data.hasNext) {
+    while (data.hasNext) {
       value = data.next()
       if (value != null) {
         count += 1
@@ -80,7 +80,7 @@ object RawTextHelper {
           }
           taken(len - 1) = value
           i = len - 1
-          while(i > 0 && taken(i - 1)._2 < taken(i)._2) {
+          while (i > 0 && taken(i - 1)._2 < taken(i)._2) {
             swap = taken(i)
             taken(i) = taken(i-1)
             taken(i - 1) = swap
@@ -89,7 +89,7 @@ object RawTextHelper {
         }
       }
     }
-    taken.toIterator
+    taken.iterator
   }
 
   /**

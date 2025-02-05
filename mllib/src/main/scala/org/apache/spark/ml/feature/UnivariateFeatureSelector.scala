@@ -32,6 +32,7 @@ import org.apache.spark.ml.util._
 import org.apache.spark.sql.{DataFrame, Dataset, SparkSession}
 import org.apache.spark.sql.functions.{col, udf}
 import org.apache.spark.sql.types.{StructField, StructType}
+import org.apache.spark.util.ArrayImplicits._
 
 
 /**
@@ -164,7 +165,7 @@ final class UnivariateFeatureSelector @Since("3.1.1")(@Since("3.1.1") override v
   @Since("3.1.1")
   override def fit(dataset: Dataset[_]): UnivariateFeatureSelectorModel = {
     transformSchema(dataset.schema, logging = true)
-    val numFeatures = MetadataUtils.getNumFeatures(dataset, $(featuresCol))
+    val numFeatures = DatasetUtils.getNumFeatures(dataset, $(featuresCol))
 
     var threshold = Double.NaN
     if (isSet(selectionThreshold)) {
@@ -179,11 +180,11 @@ final class UnivariateFeatureSelector @Since("3.1.1")(@Since("3.1.1") override v
 
     val resultDF = ($(featureType), $(labelType)) match {
       case ("categorical", "categorical") =>
-        ChiSquareTest.test(dataset.toDF, getFeaturesCol, getLabelCol, true)
+        ChiSquareTest.test(dataset.toDF(), getFeaturesCol, getLabelCol, true)
       case ("continuous", "categorical") =>
-        ANOVATest.test(dataset.toDF, getFeaturesCol, getLabelCol, true)
+        ANOVATest.test(dataset.toDF(), getFeaturesCol, getLabelCol, true)
       case ("continuous", "continuous") =>
-        FValueTest.test(dataset.toDF, getFeaturesCol, getLabelCol, true)
+        FValueTest.test(dataset.toDF(), getFeaturesCol, getLabelCol, true)
       case _ =>
         throw new IllegalArgumentException(s"Unsupported combination:" +
           s" featureType=${$(featureType)}, labelType=${$(labelType)}")
@@ -227,7 +228,7 @@ final class UnivariateFeatureSelector @Since("3.1.1")(@Since("3.1.1") override v
         val maxIndex = resultDF.sort("pValue", "featureIndex")
           .select("pValue")
           .as[Double].rdd
-          .zipWithIndex
+          .zipWithIndex()
           .flatMap { case (pValue, index) =>
             if (pValue <= f * (index + 1)) {
               Iterator.single(index.toInt)
@@ -287,6 +288,9 @@ class UnivariateFeatureSelectorModel private[ml](
     @Since("3.1.1") val selectedFeatures: Array[Int])
   extends Model[UnivariateFeatureSelectorModel] with UnivariateFeatureSelectorParams
     with MLWritable {
+
+  private[ml] def this() = this(
+    Identifiable.randomUID("UnivariateFeatureSelector"), Array.emptyIntArray)
 
   /** @group setParam */
   @Since("3.1.1")
@@ -348,10 +352,10 @@ object UnivariateFeatureSelectorModel extends MLReadable[UnivariateFeatureSelect
     private case class Data(selectedFeatures: Seq[Int])
 
     override protected def saveImpl(path: String): Unit = {
-      DefaultParamsWriter.saveMetadata(instance, path, sc)
-      val data = Data(instance.selectedFeatures.toSeq)
+      DefaultParamsWriter.saveMetadata(instance, path, sparkSession)
+      val data = Data(instance.selectedFeatures.toImmutableArraySeq)
       val dataPath = new Path(path, "data").toString
-      sparkSession.createDataFrame(Seq(data)).repartition(1).write.parquet(dataPath)
+      sparkSession.createDataFrame(Seq(data)).write.parquet(dataPath)
     }
   }
 
@@ -362,7 +366,7 @@ object UnivariateFeatureSelectorModel extends MLReadable[UnivariateFeatureSelect
     private val className = classOf[UnivariateFeatureSelectorModel].getName
 
     override def load(path: String): UnivariateFeatureSelectorModel = {
-      val metadata = DefaultParamsReader.loadMetadata(path, sc, className)
+      val metadata = DefaultParamsReader.loadMetadata(path, sparkSession, className)
       val dataPath = new Path(path, "data").toString
       val data = sparkSession.read.parquet(dataPath)
         .select("selectedFeatures").head()
@@ -409,7 +413,9 @@ object UnivariateFeatureSelectorModel extends MLReadable[UnivariateFeatureSelect
       featuresCol: String,
       isNumericAttribute: Boolean): StructField = {
     val selector = selectedFeatures.toSet
-    val origAttrGroup = AttributeGroup.fromStructField(schema(featuresCol))
+    val origAttrGroup = AttributeGroup.fromStructField(
+      SchemaUtils.getSchemaField(schema, featuresCol)
+    )
     val featureAttributes: Array[Attribute] = if (origAttrGroup.attributes.nonEmpty) {
       origAttrGroup.attributes.get.zipWithIndex.filter(x => selector.contains(x._2)).map(_._1)
     } else {

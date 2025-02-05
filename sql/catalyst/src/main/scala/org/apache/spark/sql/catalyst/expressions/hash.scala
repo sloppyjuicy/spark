@@ -28,15 +28,20 @@ import org.apache.commons.codec.digest.MessageDigestAlgorithms
 
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.TypeCheckResult
+import org.apache.spark.sql.catalyst.analysis.TypeCheckResult.DataTypeMismatch
+import org.apache.spark.sql.catalyst.expressions.Cast._
 import org.apache.spark.sql.catalyst.expressions.codegen._
 import org.apache.spark.sql.catalyst.expressions.codegen.Block._
-import org.apache.spark.sql.catalyst.util.{ArrayData, MapData}
+import org.apache.spark.sql.catalyst.types.DataTypeUtils
+import org.apache.spark.sql.catalyst.util.{ArrayData, CollationFactory, MapData}
 import org.apache.spark.sql.catalyst.util.DateTimeConstants._
+import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.Platform
 import org.apache.spark.unsafe.hash.Murmur3_x86_32
 import org.apache.spark.unsafe.types.{CalendarInterval, UTF8String}
+import org.apache.spark.util.ArrayImplicits._
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // This file defines all the expressions for hashing.
@@ -56,9 +61,10 @@ import org.apache.spark.unsafe.types.{CalendarInterval, UTF8String}
   since = "1.5.0",
   group = "hash_funcs")
 case class Md5(child: Expression)
-  extends UnaryExpression with ImplicitCastInputTypes with NullIntolerant {
-
-  override def dataType: DataType = StringType
+  extends UnaryExpression
+  with ImplicitCastInputTypes
+  with DefaultStringProducingExpression {
+  override def nullIntolerant: Boolean = true
 
   override def inputTypes: Seq[DataType] = Seq(BinaryType)
 
@@ -96,9 +102,12 @@ case class Md5(child: Expression)
   group = "hash_funcs")
 // scalastyle:on line.size.limit
 case class Sha2(left: Expression, right: Expression)
-  extends BinaryExpression with ImplicitCastInputTypes with NullIntolerant with Serializable {
+  extends BinaryExpression
+  with ImplicitCastInputTypes
+  with Serializable
+  with DefaultStringProducingExpression {
+  override def nullIntolerant: Boolean = true
 
-  override def dataType: DataType = StringType
   override def nullable: Boolean = true
 
   override def inputTypes: Seq[DataType] = Seq(BinaryType, IntegerType)
@@ -162,9 +171,10 @@ case class Sha2(left: Expression, right: Expression)
   since = "1.5.0",
   group = "hash_funcs")
 case class Sha1(child: Expression)
-  extends UnaryExpression with ImplicitCastInputTypes with NullIntolerant {
-
-  override def dataType: DataType = StringType
+  extends UnaryExpression
+  with ImplicitCastInputTypes
+  with DefaultStringProducingExpression {
+  override def nullIntolerant: Boolean = true
 
   override def inputTypes: Seq[DataType] = Seq(BinaryType)
 
@@ -194,7 +204,8 @@ case class Sha1(child: Expression)
   since = "1.5.0",
   group = "hash_funcs")
 case class Crc32(child: Expression)
-  extends UnaryExpression with ImplicitCastInputTypes with NullIntolerant {
+  extends UnaryExpression with ImplicitCastInputTypes {
+  override def nullIntolerant: Boolean = true
 
   override def dataType: DataType = LongType
 
@@ -266,17 +277,24 @@ abstract class HashExpression[E] extends Expression {
     dt.existsRecursively(_.isInstanceOf[MapType])
   }
 
+  private def hasVariantType(dt: DataType): Boolean = {
+    dt.existsRecursively(_.isInstanceOf[VariantType])
+  }
+
   override def checkInputDataTypes(): TypeCheckResult = {
     if (children.length < 1) {
-      TypeCheckResult.TypeCheckFailure(
-        s"input to function $prettyName requires at least one argument")
+      throw QueryCompilationErrors.wrongNumArgsError(
+        toSQLId(prettyName), Seq("> 0"), children.length
+      )
     } else if (children.exists(child => hasMapType(child.dataType)) &&
         !SQLConf.get.getConf(SQLConf.LEGACY_ALLOW_HASH_ON_MAPTYPE)) {
-      TypeCheckResult.TypeCheckFailure(
-        s"input to function $prettyName cannot contain elements of MapType. In Spark, same maps " +
-          "may have different hashcode, thus hash expressions are prohibited on MapType elements." +
-          s" To restore previous behavior set ${SQLConf.LEGACY_ALLOW_HASH_ON_MAPTYPE.key} " +
-          "to true.")
+      DataTypeMismatch(
+        errorSubClass = "HASH_MAP_TYPE",
+        messageParameters = Map("functionName" -> toSQLId(prettyName)))
+    } else if (children.exists(child => hasVariantType(child.dataType))) {
+      DataTypeMismatch(
+        errorSubClass = "HASH_VARIANT_TYPE",
+        messageParameters = Map("functionName" -> toSQLId(prettyName)))
     } else {
       TypeCheckResult.TypeCheckSuccess
     }
@@ -300,13 +318,13 @@ abstract class HashExpression[E] extends Expression {
 
     val childrenHash = children.map { child =>
       val childGen = child.genCode(ctx)
-      childGen.code + ctx.nullSafeExec(child.nullable, childGen.isNull) {
+      childGen.code.toString + ctx.nullSafeExec(child.nullable, childGen.isNull) {
         computeHash(childGen.value, child.dataType, ev.value, ctx)
       }
     }
 
     val hashResultType = CodeGenerator.javaType(dataType)
-    val typedSeed = if (dataType.sameType(LongType)) s"${seed}L" else s"$seed"
+    val typedSeed = if (DataTypeUtils.sameType(dataType, LongType)) s"${seed}L" else s"$seed"
     val codes = ctx.splitExpressionsWithCurrentInputs(
       expressions = childrenHash,
       funcName = "computeHash",
@@ -401,11 +419,22 @@ abstract class HashExpression[E] extends Expression {
     s"$result = $hasherClassName.hashInt($input.months, $microsecondsHash);"
   }
 
-  protected def genHashString(input: String, result: String): String = {
-    val baseObject = s"$input.getBaseObject()"
-    val baseOffset = s"$input.getBaseOffset()"
-    val numBytes = s"$input.numBytes()"
-    s"$result = $hasherClassName.hashUnsafeBytes($baseObject, $baseOffset, $numBytes, $result);"
+  protected def genHashString(
+      ctx: CodegenContext, stringType: StringType, input: String, result: String): String = {
+    if (stringType.supportsBinaryEquality) {
+      val baseObject = s"$input.getBaseObject()"
+      val baseOffset = s"$input.getBaseOffset()"
+      val numBytes = s"$input.numBytes()"
+      s"$result = $hasherClassName.hashUnsafeBytes($baseObject, $baseOffset, $numBytes, $result);"
+    } else {
+      val stringHash = ctx.freshName("stringHash")
+      s"""
+        long $stringHash = CollationFactory.fetchCollation(${stringType.collationId})
+          .hashFunction.applyAsLong($input);
+        $result = $hasherClassName.hashLong($stringHash, $result);
+      """
+    }
+
   }
 
   protected def genHashForMap(
@@ -453,7 +482,7 @@ abstract class HashExpression[E] extends Expression {
     }
     val hashResultType = CodeGenerator.javaType(dataType)
     val code = ctx.splitExpressions(
-      expressions = fieldsHash,
+      expressions = fieldsHash.toImmutableArraySeq,
       funcName = "computeHashForStruct",
       arguments = Seq("InternalRow" -> tmpInput, hashResultType -> result),
       returnType = hashResultType,
@@ -487,7 +516,7 @@ abstract class HashExpression[E] extends Expression {
     case _: DayTimeIntervalType => genHashLong(input, result)
     case _: YearMonthIntervalType => genHashInt(input, result)
     case BinaryType => genHashBytes(input, result)
-    case StringType => genHashString(input, result)
+    case st: StringType => genHashString(ctx, st, input, result)
     case ArrayType(et, containsNull) => genHashForArray(ctx, input, result, et, containsNull)
     case MapType(kt, vt, valueContainsNull) =>
       genHashForMap(ctx, input, result, kt, vt, valueContainsNull)
@@ -542,7 +571,15 @@ abstract class InterpretedHashFunction {
       case a: Array[Byte] =>
         hashUnsafeBytes(a, Platform.BYTE_ARRAY_OFFSET, a.length, seed)
       case s: UTF8String =>
-        hashUnsafeBytes(s.getBaseObject, s.getBaseOffset, s.numBytes(), seed)
+        val st = dataType.asInstanceOf[StringType]
+        if (st.supportsBinaryEquality) {
+          hashUnsafeBytes(s.getBaseObject, s.getBaseOffset, s.numBytes(), seed)
+        } else {
+          val stringHash = CollationFactory
+            .fetchCollation(st.collationId)
+            .hashFunction.applyAsLong(s)
+          hashLong(stringHash, seed)
+        }
 
       case array: ArrayData =>
         val elementType = dataType match {
@@ -643,7 +680,8 @@ object Murmur3HashFunction extends InterpretedHashFunction {
  * A xxHash64 64-bit hash expression.
  */
 @ExpressionDescription(
-  usage = "_FUNC_(expr1, expr2, ...) - Returns a 64-bit hash value of the arguments.",
+  usage = "_FUNC_(expr1, expr2, ...) - Returns a 64-bit hash value of the arguments. " +
+    "Hash seed is 42.",
   examples = """
     Examples:
       > SELECT _FUNC_('Spark', array(123), 2);
@@ -783,11 +821,21 @@ case class HiveHash(children: Seq[Expression]) extends HashExpression[Int] {
       $result = (int) ${HiveHashFunction.getClass.getName.stripSuffix("$")}.hashTimestamp($input);
      """
 
-  override protected def genHashString(input: String, result: String): String = {
-    val baseObject = s"$input.getBaseObject()"
-    val baseOffset = s"$input.getBaseOffset()"
-    val numBytes = s"$input.numBytes()"
-    s"$result = $hasherClassName.hashUnsafeBytes($baseObject, $baseOffset, $numBytes);"
+  override protected def genHashString(
+      ctx: CodegenContext, stringType: StringType, input: String, result: String): String = {
+    if (stringType.supportsBinaryEquality) {
+      val baseObject = s"$input.getBaseObject()"
+      val baseOffset = s"$input.getBaseOffset()"
+      val numBytes = s"$input.numBytes()"
+      s"$result = $hasherClassName.hashUnsafeBytes($baseObject, $baseOffset, $numBytes);"
+    } else {
+      val stringHash = ctx.freshName("stringHash")
+      s"""
+        long $stringHash = CollationFactory.fetchCollation(${stringType.collationId})
+          .hashFunction.applyAsLong($input);
+        $result = $hasherClassName.hashLong($stringHash);
+      """
+    }
   }
 
   override protected def genHashForArray(
@@ -853,7 +901,7 @@ case class HiveHash(children: Seq[Expression]) extends HashExpression[Int] {
     }
 
     val code = ctx.splitExpressions(
-      expressions = fieldsHash,
+      expressions = fieldsHash.toImmutableArraySeq,
       funcName = "computeHashForStruct",
       arguments = Seq("InternalRow" -> tmpInput, CodeGenerator.JAVA_INT -> result),
       returnType = CodeGenerator.JAVA_INT,

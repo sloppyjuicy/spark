@@ -31,3 +31,11 @@ github:
     merge: false
     squash: true
     rebase: true
+  ghp_branch: master
+  ghp_path: /docs
+
+notifications:
+  pullrequests: reviews@spark.apache.org
+  issues: reviews@spark.apache.org
+  commits: commits@spark.apache.org
+  jira_options: link label

@@ -21,23 +21,24 @@ import org.apache.hadoop.fs.Path
 
 import org.apache.spark.annotation.Since
 import org.apache.spark.broadcast.Broadcast
+import org.apache.spark.internal.{LogKeys, MDC}
 import org.apache.spark.ml.{Estimator, Model}
-import org.apache.spark.ml.functions.checkNonNegativeWeight
 import org.apache.spark.ml.impl.Utils.{unpackUpperTriangular, EPSILON}
 import org.apache.spark.ml.linalg._
 import org.apache.spark.ml.param._
 import org.apache.spark.ml.param.shared._
 import org.apache.spark.ml.stat.distribution.MultivariateGaussian
 import org.apache.spark.ml.util._
+import org.apache.spark.ml.util.DatasetUtils._
 import org.apache.spark.ml.util.Instrumentation.instrumented
 import org.apache.spark.mllib.linalg.{Matrices => OldMatrices, Matrix => OldMatrix,
   Vector => OldVector, Vectors => OldVectors}
 import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.{DataFrame, Dataset, SparkSession}
+import org.apache.spark.sql._
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
 import org.apache.spark.storage.StorageLevel
-
+import org.apache.spark.util.ArrayImplicits._
 
 /**
  * Common params for GaussianMixture and GaussianMixtureModel
@@ -92,6 +93,9 @@ class GaussianMixtureModel private[ml] (
   extends Model[GaussianMixtureModel] with GaussianMixtureParams with MLWritable
   with HasTrainingSummary[GaussianMixtureSummary] {
 
+  private[ml] def this() = this(Identifiable.randomUID("gmm"),
+    Array.emptyDoubleArray, Array.empty)
+
   @Since("3.0.0")
   lazy val numFeatures: Int = gaussians.head.mean.size
 
@@ -117,7 +121,7 @@ class GaussianMixtureModel private[ml] (
   override def transform(dataset: Dataset[_]): DataFrame = {
     val outputSchema = transformSchema(dataset.schema, logging = true)
 
-    val vectorCol = DatasetUtils.columnToVector(dataset, $(featuresCol))
+    val vectorCol = columnToVector(dataset, $(featuresCol))
     var outputData = dataset
     var numColsOutput = 0
 
@@ -142,10 +146,10 @@ class GaussianMixtureModel private[ml] (
     }
 
     if (numColsOutput == 0) {
-      this.logWarning(s"$uid: GaussianMixtureModel.transform() does nothing" +
-        " because no output columns were set.")
+      this.logWarning(log"${MDC(LogKeys.UUID, uid)}: GaussianMixtureModel.transform() does " +
+        log"nothing because no output columns were set.")
     }
-    outputData.toDF
+    outputData.toDF()
   }
 
   @Since("2.0.0")
@@ -189,7 +193,7 @@ class GaussianMixtureModel private[ml] (
   def gaussiansDF: DataFrame = {
     val modelGaussians = gaussians.map { gaussian =>
       (OldVectors.fromML(gaussian.mean), OldMatrices.fromML(gaussian.cov))
-    }
+    }.toImmutableArraySeq
     SparkSession.builder().getOrCreate().createDataFrame(modelGaussians).toDF("mean", "cov")
   }
 
@@ -234,7 +238,7 @@ object GaussianMixtureModel extends MLReadable[GaussianMixtureModel] {
 
     override protected def saveImpl(path: String): Unit = {
       // Save metadata and Params
-      DefaultParamsWriter.saveMetadata(instance, path, sc)
+      DefaultParamsWriter.saveMetadata(instance, path, sparkSession)
       // Save model data: weights and gaussians
       val weights = instance.weights
       val gaussians = instance.gaussians
@@ -242,7 +246,7 @@ object GaussianMixtureModel extends MLReadable[GaussianMixtureModel] {
       val sigmas = gaussians.map(c => OldMatrices.fromML(c.cov))
       val data = Data(weights, mus, sigmas)
       val dataPath = new Path(path, "data").toString
-      sparkSession.createDataFrame(Seq(data)).repartition(1).write.parquet(dataPath)
+      sparkSession.createDataFrame(Seq(data)).write.parquet(dataPath)
     }
   }
 
@@ -252,7 +256,7 @@ object GaussianMixtureModel extends MLReadable[GaussianMixtureModel] {
     private val className = classOf[GaussianMixtureModel].getName
 
     override def load(path: String): GaussianMixtureModel = {
-      val metadata = DefaultParamsReader.loadMetadata(path, sc, className)
+      val metadata = DefaultParamsReader.loadMetadata(path, sparkSession, className)
 
       val dataPath = new Path(path, "data").toString
       val row = sparkSession.read.parquet(dataPath).select("weights", "mus", "sigmas").head()
@@ -381,7 +385,7 @@ class GaussianMixture @Since("2.0.0") (
     val spark = dataset.sparkSession
     import spark.implicits._
 
-    val numFeatures = MetadataUtils.getNumFeatures(dataset, $(featuresCol))
+    val numFeatures = getNumFeatures(dataset, $(featuresCol))
     require(numFeatures < GaussianMixture.MAX_NUM_FEATURES, s"GaussianMixture cannot handle more " +
       s"than ${GaussianMixture.MAX_NUM_FEATURES} features because the size of the covariance" +
       s" matrix is quadratic in the number of features.")
@@ -392,15 +396,11 @@ class GaussianMixture @Since("2.0.0") (
       seed, tol, aggregationDepth)
     instr.logNumFeatures(numFeatures)
 
-    val w = if (isDefined(weightCol) && $(weightCol).nonEmpty) {
-      checkNonNegativeWeight(col($(weightCol)).cast(DoubleType))
-    } else {
-      lit(1.0)
-    }
-
-    val instances = dataset.select(DatasetUtils.columnToVector(dataset, $(featuresCol)), w)
-      .as[(Vector, Double)].rdd
-      .setName("training instances")
+    val instances = dataset.select(
+      checkNonNanVectors(columnToVector(dataset, $(featuresCol))),
+      checkNonNegativeWeights(get(weightCol))
+    ).as[(Vector, Double)].rdd
+     .setName("training instances")
 
     val handlePersistence = dataset.storageLevel == StorageLevel.NONE
     if (handlePersistence) { instances.persist(StorageLevel.MEMORY_AND_DISK) }
@@ -445,7 +445,7 @@ class GaussianMixture @Since("2.0.0") (
       instances.mapPartitions { iter =>
         if (iter.nonEmpty) {
           val agg = new ExpectationAggregator(numFeatures, bcWeights, bcGaussians)
-          while (iter.hasNext) { agg.add(iter.next) }
+          while (iter.hasNext) { agg.add(iter.next()) }
           // sum of weights in this partition
           val ws = agg.weights.sum
           if (iteration == 0) weightSumAccum.add(ws)
@@ -512,8 +512,8 @@ class GaussianMixture @Since("2.0.0") (
     val gaussians = Array.tabulate(numClusters) { i =>
       val start = i * numSamples
       val end = start + numSamples
-      val sampleSlice = samples.view.slice(start, end)
-      val weightSlice = sampleWeights.view.slice(start, end)
+      val sampleSlice = samples.slice(start, end)
+      val weightSlice = sampleWeights.slice(start, end)
       val localWeightSum = weightSlice.sum
       weights(i) = localWeightSum / weightSum
 

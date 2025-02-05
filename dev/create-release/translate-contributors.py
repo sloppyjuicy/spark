@@ -31,18 +31,59 @@
 import os
 import sys
 
-from releaseutils import JIRA, JIRAError, get_jira_name, Github, get_github_name, \
-    contributors_file_name, is_valid_author, capitalize_author, yesOrNoPrompt
+from releaseutils import (
+    JIRA,
+    JIRAError,
+    get_jira_name,
+    Github,
+    get_github_name,
+    contributors_file_name,
+    is_valid_author,
+    capitalize_author,
+    yesOrNoPrompt,
+)
 
 # You must set the following before use!
 JIRA_API_BASE = os.environ.get("JIRA_API_BASE", "https://issues.apache.org/jira")
 JIRA_USERNAME = os.environ.get("JIRA_USERNAME", None)
 JIRA_PASSWORD = os.environ.get("JIRA_PASSWORD", None)
+# ASF JIRA access token
+# If it is configured, username and password are dismissed
+# Go to https://issues.apache.org/jira/secure/ViewProfile.jspa -> Personal Access Tokens for
+# your own token management.
+JIRA_ACCESS_TOKEN = os.environ.get("JIRA_ACCESS_TOKEN")
+
 GITHUB_OAUTH_KEY = os.environ.get("GITHUB_OAUTH_KEY", os.environ.get("GITHUB_API_TOKEN", None))
-if not JIRA_USERNAME or not JIRA_PASSWORD:
-    sys.exit("Both JIRA_USERNAME and JIRA_PASSWORD must be set")
+
 if not GITHUB_OAUTH_KEY:
     sys.exit("GITHUB_OAUTH_KEY must be set")
+
+# Setup JIRA client
+jira_options = {"server": JIRA_API_BASE}
+if JIRA_ACCESS_TOKEN:
+    client = JIRA(jira_options, token_auth=JIRA_ACCESS_TOKEN)
+    try:
+        # Eagerly check if the token is valid to align with the behavior of username/password
+        # authn
+        client.current_user()
+        jira_client = client
+    except Exception as e:
+        if e.__class__.__name__ == "JIRAError" and getattr(e, "status_code", None) == 401:
+            msg = (
+                "ASF JIRA could not authenticate with the invalid or expired token '%s'"
+                % JIRA_ACCESS_TOKEN
+            )
+            sys.exit(msg)
+        else:
+            raise e
+elif JIRA_USERNAME and JIRA_PASSWORD:
+    print("You can use JIRA_ACCESS_TOKEN instead of JIRA_USERNAME/JIRA_PASSWORD.")
+    print("Visit https://issues.apache.org/jira/secure/ViewProfile.jspa ")
+    print("and click 'Personal Access Tokens' menu to manage your own tokens.")
+    jira_client = JIRA(jira_options, basic_auth=(JIRA_USERNAME, JIRA_PASSWORD))
+else:
+    sys.exit("JIRA_ACCESS_TOKEN must be set.")
+
 
 # Write new contributors list to <old_file_name>.final
 if not os.path.isfile(contributors_file_name):
@@ -61,9 +102,7 @@ if len(sys.argv) > 1:
 if INTERACTIVE_MODE:
     print("Running in interactive mode. To disable this, provide the --non-interactive flag.")
 
-# Setup GitHub and JIRA clients
-jira_options = {"server": JIRA_API_BASE}
-jira_client = JIRA(options=jira_options, basic_auth=(JIRA_USERNAME, JIRA_PASSWORD))
+# Setup GitHub client
 github_client = Github(GITHUB_OAUTH_KEY)
 
 # Load known author translations that are cached locally
@@ -126,16 +165,19 @@ def generate_candidates(author, issues):
             display_name = jira_assignee.displayName
             if display_name:
                 candidates.append(
-                    (display_name, "Full name of %s assignee %s" % (issue, user_name)))
+                    (display_name, "Full name of %s assignee %s" % (issue, user_name))
+                )
             else:
                 candidates.append(
-                    (NOT_FOUND, "No full name found for %s assignee %s" % (issue, user_name)))
+                    (NOT_FOUND, "No full name found for %s assignee %s" % (issue, user_name))
+                )
         else:
             candidates.append((NOT_FOUND, "No assignee found for %s" % issue))
     for i, (candidate, source) in enumerate(candidates):
         candidate = candidate.strip()
         candidates[i] = (candidate, source)
     return candidates
+
 
 # Translate each invalid author by searching for possible candidates from GitHub and JIRA
 # In interactive mode, this script presents the user with a list of choices and have the user
@@ -151,7 +193,7 @@ for i, line in enumerate(lines):
     temp_author = line.strip(" * ").split(" -- ")[0].strip()
     print("Processing author %s (%d/%d)" % (temp_author, i + 1, len(lines)))
     if not temp_author:
-        error_msg = "    ERROR: Expected the following format \" * <author> -- <contributions>\"\n"
+        error_msg = '    ERROR: Expected the following format " * <author> -- <contributions>"\n'
         error_msg += "    ERROR: Actual = %s" % line
         print(error_msg)
         warnings.append(error_msg)
@@ -206,8 +248,9 @@ for i, line in enumerate(lines):
                 new_author = candidate_names[response]
         # In non-interactive mode, just pick the first candidate
         else:
-            valid_candidate_names = [name for name, _ in candidates
-                                     if is_valid_author(name) and name != NOT_FOUND]
+            valid_candidate_names = [
+                name for name, _ in candidates if is_valid_author(name) and name != NOT_FOUND
+            ]
             if valid_candidate_names:
                 new_author = valid_candidate_names[0]
         # Finally, capitalize the author and replace the original one with it
@@ -215,15 +258,17 @@ for i, line in enumerate(lines):
         if is_valid_author(new_author):
             new_author = capitalize_author(new_author)
         else:
-            warnings.append(
-                "Unable to find a valid name %s for author %s" % (author, temp_author))
+            warnings.append("Unable to find a valid name %s for author %s" % (author, temp_author))
         print("    * Replacing %s with %s" % (author, new_author))
         # If we are in interactive mode, prompt the user whether we want to remember this new
         # mapping
-        if INTERACTIVE_MODE and \
-            author not in known_translations and \
-                yesOrNoPrompt(
-                    "    Add mapping %s -> %s to known translations file?" % (author, new_author)):
+        if (
+            INTERACTIVE_MODE
+            and author not in known_translations
+            and yesOrNoPrompt(
+                "    Add mapping %s -> %s to known translations file?" % (author, new_author)
+            )
+        ):
             known_translations_file.write("%s - %s\n" % (author, new_author))
             known_translations_file.flush()
         line = line.replace(temp_author, author)
@@ -256,6 +301,8 @@ if warnings:
     print("\n========== Warnings encountered while translating the contributor list ===========")
     for w in warnings:
         print(w)
-    print("Please manually correct these in the final contributors list at %s." %
-          new_contributors_file_name)
+    print(
+        "Please manually correct these in the final contributors list at %s."
+        % new_contributors_file_name
+    )
     print("==================================================================================\n")

@@ -22,14 +22,16 @@ import java.lang.{Long => JLong}
 import scala.collection.mutable.ArrayBuffer
 
 import org.apache.spark._
-import org.apache.spark.sql.{functions, Dataset, QueryTest, Row, SparkSession}
+import org.apache.spark.sql.{functions, Encoder, Encoders, QueryTest, Row}
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference}
 import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, LogicalPlan, Project}
-import org.apache.spark.sql.execution.{QueryExecution, QueryExecutionException, WholeStageCodegenExec}
+import org.apache.spark.sql.classic.Dataset
+import org.apache.spark.sql.execution.{QueryExecution, WholeStageCodegenExec}
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
 import org.apache.spark.sql.execution.command.{CreateDataSourceTableAsSelectCommand, LeafRunnableCommand}
 import org.apache.spark.sql.execution.datasources.InsertIntoHadoopFsRelationCommand
 import org.apache.spark.sql.execution.datasources.json.JsonFileFormat
+import org.apache.spark.sql.expressions.Aggregator
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types.StringType
@@ -92,6 +94,34 @@ class DataFrameCallbackSuite extends QueryTest
     assert(metrics(0)._1 == "collect")
     assert(metrics(0)._2.analyzed.isInstanceOf[Project])
     assert(metrics(0)._3.getMessage == e.getMessage)
+
+    spark.listenerManager.unregister(listener)
+  }
+
+  test("execute callback functions when a DataSet trigger foreach action finished") {
+    val metrics = ArrayBuffer.empty[(String, QueryExecution, Long)]
+    val listener = new QueryExecutionListener {
+      // Only test successful case here, so no need to implement `onFailure`
+      override def onFailure(funcName: String, qe: QueryExecution, exception: Exception): Unit = {}
+
+      override def onSuccess(funcName: String, qe: QueryExecution, duration: Long): Unit = {
+        metrics += ((funcName, qe, duration))
+      }
+    }
+    spark.listenerManager.register(listener)
+
+    def f(): Unit = {}
+
+    val df = Seq(1).toDF("i")
+
+    df.foreach(r => f())
+    df.reduce((x, y) => x)
+
+    sparkContext.listenerBus.waitUntilEmpty()
+    assert(metrics.length == 2)
+
+    assert(metrics(0)._1 == "foreachPartition")
+    assert(metrics(1)._1 == "reduce")
 
     spark.listenerManager.unregister(listener)
   }
@@ -217,10 +247,14 @@ class DataFrameCallbackSuite extends QueryTest
     withTable("tab") {
       spark.range(10).select($"id", $"id" % 5 as "p").write.partitionBy("p").saveAsTable("tab")
       sparkContext.listenerBus.waitUntilEmpty()
-      assert(commands.length == 5)
-      assert(commands(4)._1 == "command")
-      assert(commands(4)._2.isInstanceOf[CreateDataSourceTableAsSelectCommand])
-      assert(commands(4)._2.asInstanceOf[CreateDataSourceTableAsSelectCommand]
+      // CTAS would derive 3 query executions
+      // 1. CreateDataSourceTableAsSelectCommand
+      // 2. InsertIntoHadoopFsRelationCommand
+      // 3. CommandResultExec
+      assert(commands.length == 6)
+      assert(commands(5)._1 == "command")
+      assert(commands(5)._2.isInstanceOf[CreateDataSourceTableAsSelectCommand])
+      assert(commands(5)._2.asInstanceOf[CreateDataSourceTableAsSelectCommand]
         .table.partitionColumnNames == Seq("p"))
     }
 
@@ -307,6 +341,51 @@ class DataFrameCallbackSuite extends QueryTest
     }
   }
 
+  test("SPARK-50581: support observe with udaf") {
+    withUserDefinedFunction(("someUdaf", true)) {
+      spark.udf.register("someUdaf", functions.udaf(new Aggregator[JLong, JLong, JLong] {
+        def zero: JLong = 0L
+        def reduce(b: JLong, a: JLong): JLong = a + b
+        def merge(b1: JLong, b2: JLong): JLong = b1 + b2
+        def finish(r: JLong): JLong = r
+        def bufferEncoder: Encoder[JLong] = Encoders.LONG
+        def outputEncoder: Encoder[JLong] = Encoders.LONG
+      }))
+
+      val df = spark.range(100)
+
+      val metricMaps = ArrayBuffer.empty[Map[String, Row]]
+      val listener = new QueryExecutionListener {
+        override def onSuccess(funcName: String, qe: QueryExecution, duration: Long): Unit = {
+          if (qe.observedMetrics.nonEmpty) {
+            metricMaps += qe.observedMetrics
+          }
+        }
+
+        override def onFailure(funcName: String, qe: QueryExecution, exception: Exception): Unit = {
+          // No-op
+        }
+      }
+      try {
+        spark.listenerManager.register(listener)
+
+        // udaf usage in observe is not working (serialization exception)
+        df.observe(
+            name = "my_metrics",
+            expr("someUdaf(id)").as("agg")
+          )
+          .collect()
+
+        sparkContext.listenerBus.waitUntilEmpty()
+        assert(metricMaps.size === 1)
+        assert(metricMaps.head("my_metrics") === Row(4950L))
+
+      } finally {
+        spark.listenerManager.unregister(listener)
+      }
+    }
+  }
+
   private def validateObservedMetrics(df: Dataset[JLong]): Unit = {
     val metricMaps = ArrayBuffer.empty[Map[String, Row]]
     val listener = new QueryExecutionListener {
@@ -359,7 +438,7 @@ class DataFrameCallbackSuite extends QueryTest
       Dataset.ofRows(spark, ErrorTestCommand("foo")).collect()
     }
     sparkContext.listenerBus.waitUntilEmpty()
-    assert(e != null && e.isInstanceOf[QueryExecutionException]
+    assert(e != null && e.isInstanceOf[SparkException]
       && e.getCause.isInstanceOf[Error] && e.getCause.getMessage == "foo")
     spark.listenerManager.unregister(listener)
   }
@@ -370,6 +449,6 @@ case class ErrorTestCommand(foo: String) extends LeafRunnableCommand {
 
   override val output: Seq[Attribute] = Seq(AttributeReference("foo", StringType)())
 
-  override def run(sparkSession: SparkSession): Seq[Row] =
+  override def run(sparkSession: org.apache.spark.sql.SparkSession): Seq[Row] =
     throw new java.lang.Error(foo)
 }

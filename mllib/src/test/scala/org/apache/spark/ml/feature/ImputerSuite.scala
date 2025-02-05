@@ -19,7 +19,7 @@ package org.apache.spark.ml.feature
 import org.apache.spark.SparkException
 import org.apache.spark.ml.Pipeline
 import org.apache.spark.ml.param.ParamsSuite
-import org.apache.spark.ml.util.{DefaultReadWriteTest, MLTest}
+import org.apache.spark.ml.util.{DefaultReadWriteTest, MLTest, SchemaUtils}
 import org.apache.spark.mllib.util.TestingUtils._
 import org.apache.spark.sql.{DataFrame, Row}
 import org.apache.spark.sql.functions._
@@ -268,6 +268,16 @@ class ImputerSuite extends MLTest with DefaultReadWriteTest {
         }
         assert(e.getMessage.contains("outputCols contains duplicates"))
       }
+
+      withClue("Imputer should fail if inputCols param is empty.") {
+        val e: IllegalArgumentException = intercept[IllegalArgumentException] {
+          val imputer = new Imputer().setStrategy(strategy)
+            .setInputCols(Array[String]())
+            .setOutputCols(Array[String]())
+          val model = imputer.fit(df)
+        }
+        assert(e.getMessage.contains("inputCols cannot be empty"))
+      }
     }
   }
 
@@ -329,9 +339,10 @@ class ImputerSuite extends MLTest with DefaultReadWriteTest {
       .setOutputCols(Array("out1"))
 
     val types = Seq(IntegerType, LongType)
+    import org.apache.spark.util.ArrayImplicits._
     for (mType <- types) {
       // cast all columns to desired data type for testing
-      val df2 = df.select(df.columns.map(c => col(c).cast(mType)): _*)
+      val df2 = df.select(df.columns.map(c => col(c).cast(mType)).toImmutableArraySeq: _*)
       ImputerSuite.iterateStrategyTest(true, imputer, df2)
     }
   }
@@ -350,9 +361,10 @@ class ImputerSuite extends MLTest with DefaultReadWriteTest {
       .setOutputCol("out")
 
     val types = Seq(IntegerType, LongType)
+    import org.apache.spark.util.ArrayImplicits._
     for (mType <- types) {
       // cast all columns to desired data type for testing
-      val df2 = df.select(df.columns.map(c => col(c).cast(mType)): _*)
+      val df2 = df.select(df.columns.map(c => col(c).cast(mType)).toImmutableArraySeq: _*)
       ImputerSuite.iterateStrategyTest(false, imputer, df2)
     }
   }
@@ -372,9 +384,10 @@ class ImputerSuite extends MLTest with DefaultReadWriteTest {
       .setMissingValue(-1.0)
 
     val types = Seq(IntegerType, LongType)
+    import org.apache.spark.util.ArrayImplicits._
     for (mType <- types) {
       // cast all columns to desired data type for testing
-      val df2 = df.select(df.columns.map(c => col(c).cast(mType)): _*)
+      val df2 = df.select(df.columns.map(c => col(c).cast(mType)).toImmutableArraySeq: _*)
       ImputerSuite.iterateStrategyTest(true, imputer, df2)
     }
   }
@@ -394,9 +407,10 @@ class ImputerSuite extends MLTest with DefaultReadWriteTest {
       .setMissingValue(-1.0)
 
     val types = Seq(IntegerType, LongType)
+    import org.apache.spark.util.ArrayImplicits._
     for (mType <- types) {
       // cast all columns to desired data type for testing
-      val df2 = df.select(df.columns.map(c => col(c).cast(mType)): _*)
+      val df2 = df.select(df.columns.map(c => col(c).cast(mType)).toImmutableArraySeq: _*)
       ImputerSuite.iterateStrategyTest(false, imputer, df2)
     }
   }
@@ -457,6 +471,23 @@ class ImputerSuite extends MLTest with DefaultReadWriteTest {
       }
     }
   }
+
+  test("Imputer nested input column") {
+    val df = spark.createDataFrame(Seq(
+      (0, 1.0, 4.0, 1.0, 1.0, 1.0, 4.0, 4.0, 4.0),
+      (1, 11.0, 12.0, 11.0, 11.0, 11.0, 12.0, 12.0, 12.0),
+      (2, 3.0, Double.NaN, 3.0, 3.0, 3.0, 10.0, 12.0, 4.0),
+      (3, Double.NaN, 14.0, 5.0, 3.0, 1.0, 14.0, 14.0, 14.0)
+    )).toDF("id", "value1", "value2",
+      "expected_mean_value1", "expected_median_value1", "expected_mode_value1",
+      "expected_mean_value2", "expected_median_value2", "expected_mode_value2")
+      .withColumn("nest", struct("value1", "value2"))
+      .drop("value1", "value2")
+    val imputer = new Imputer()
+      .setInputCols(Array("nest.value1", "nest.value2"))
+      .setOutputCols(Array("out1", "out2"))
+    ImputerSuite.iterateStrategyTest(true, imputer, df)
+  }
 }
 
 object ImputerSuite {
@@ -487,12 +518,14 @@ object ImputerSuite {
       outputCol: String,
       resultDF: DataFrame): Unit = {
     // check dataType is consistent between input and output
-    val inputType = resultDF.schema(inputCol).dataType
-    val outputType = resultDF.schema(outputCol).dataType
+    val inputType = SchemaUtils.getSchemaFieldType(resultDF.schema, inputCol)
+    val outputType = SchemaUtils.getSchemaFieldType(resultDF.schema, outputCol)
     assert(inputType == outputType, "Output type is not the same as input type.")
 
+    val inputColSplits = inputCol.split("\\.")
+    val inputColLastSplit = inputColSplits(inputColSplits.length - 1)
     // check value
-    resultDF.select(s"expected_${strategy}_$inputCol", outputCol).collect().foreach {
+    resultDF.select(s"expected_${strategy}_$inputColLastSplit", outputCol).collect().foreach {
       case Row(exp: Float, out: Float) =>
         assert((exp.isNaN && out.isNaN) || (exp == out),
           s"Imputed values differ. Expected: $exp, actual: $out")

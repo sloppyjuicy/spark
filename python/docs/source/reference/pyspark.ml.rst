@@ -104,6 +104,8 @@ Feature
     StopWordsRemover
     StringIndexer
     StringIndexerModel
+    TargetEncoder
+    TargetEncoderModel
     Tokenizer
     UnivariateFeatureSelector
     UnivariateFeatureSelectorModel
@@ -196,6 +198,7 @@ Functions
 
     array_to_vector
     vector_to_array
+    predict_batch_udf
 
 
 Vector and Matrix
@@ -337,6 +340,26 @@ Image
 
     ImageSchema
     _ImageSchema
+
+
+Distributor
+-----------
+
+
+.. currentmodule:: pyspark.ml.torch.distributor
+
+.. autosummary::
+    :template: autosummary/class_with_docs.rst
+    :toctree: api/
+
+    TorchDistributor
+
+.. currentmodule:: pyspark.ml.deepspeed.deepspeed_distributor
+.. autosummary::
+    :template: autosummary/class_with_docs.rst
+    :toctree: api/
+
+    DeepspeedTorchDistributor
 
 
 Utilities

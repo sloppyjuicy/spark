@@ -31,6 +31,7 @@ import org.apache.spark.sql.{DataFrame, Dataset}
 import org.apache.spark.sql.expressions.UserDefinedFunction
 import org.apache.spark.sql.functions.{col, lit, udf}
 import org.apache.spark.sql.types.{DoubleType, StructField, StructType}
+import org.apache.spark.util.ArrayImplicits._
 
 /** Private trait for params and common methods for OneHotEncoder and OneHotEncoderModel */
 private[ml] trait OneHotEncoderBase extends Params with HasHandleInvalid
@@ -88,10 +89,12 @@ private[ml] trait OneHotEncoderBase extends Params with HasHandleInvalid
         s"output columns ${outputColNames.length}.")
 
     // Input columns must be NumericType.
-    inputColNames.foreach(SchemaUtils.checkNumericType(schema, _))
+    inputColNames.foreach { colName =>
+      SchemaUtils.checkNumericType(schema, colName)
+    }
 
     // Prepares output columns with proper attributes by examining input columns.
-    val inputFields = inputColNames.map(schema(_))
+    val inputFields = inputColNames.map(SchemaUtils.getSchemaField(schema, _))
 
     val outputFields = inputFields.zip(outputColNames).map { case (inputField, outputColName) =>
       OneHotEncoderCommon.transformOutputColumnSchema(
@@ -193,7 +196,8 @@ class OneHotEncoder @Since("3.0.0") (@Since("3.0.0") override val uid: String)
       // When fitting data, we want the plain number of categories without `handleInvalid` and
       // `dropLast` taken into account.
       val attrGroups = OneHotEncoderCommon.getOutputAttrGroupFromData(
-        dataset, inputColNames, outputColNames, dropLast = false)
+        dataset, inputColNames.toImmutableArraySeq, outputColNames.toImmutableArraySeq,
+        dropLast = false)
       attrGroups.zip(columnToScanIndices).foreach { case (attrGroup, idx) =>
         categorySizes(idx) = attrGroup.size
       }
@@ -229,6 +233,8 @@ class OneHotEncoderModel private[ml] (
   extends Model[OneHotEncoderModel] with OneHotEncoderBase with MLWritable {
 
   import OneHotEncoderModel._
+
+  private[ml] def this() = this(Identifiable.randomUID("oneHotEncoder)"), Array.emptyIntArray)
 
   // Returns the category size for each index with `dropLast` and `handleInvalid`
   // taken into account.
@@ -372,7 +378,7 @@ class OneHotEncoderModel private[ml] (
       encoder(col(inputColName).cast(DoubleType), lit(idx))
         .as(outputColName, metadata)
     }
-    dataset.withColumns(outputColNames, encodedColumns)
+    dataset.withColumns(outputColNames.toImmutableArraySeq, encodedColumns)
   }
 
   @Since("3.0.0")
@@ -401,10 +407,10 @@ object OneHotEncoderModel extends MLReadable[OneHotEncoderModel] {
     private case class Data(categorySizes: Array[Int])
 
     override protected def saveImpl(path: String): Unit = {
-      DefaultParamsWriter.saveMetadata(instance, path, sc)
+      DefaultParamsWriter.saveMetadata(instance, path, sparkSession)
       val data = Data(instance.categorySizes)
       val dataPath = new Path(path, "data").toString
-      sparkSession.createDataFrame(Seq(data)).repartition(1).write.parquet(dataPath)
+      sparkSession.createDataFrame(Seq(data)).write.parquet(dataPath)
     }
   }
 
@@ -413,7 +419,7 @@ object OneHotEncoderModel extends MLReadable[OneHotEncoderModel] {
     private val className = classOf[OneHotEncoderModel].getName
 
     override def load(path: String): OneHotEncoderModel = {
-      val metadata = DefaultParamsReader.loadMetadata(path, sc, className)
+      val metadata = DefaultParamsReader.loadMetadata(path, sparkSession, className)
       val dataPath = new Path(path, "data").toString
       val data = sparkSession.read.parquet(dataPath)
         .select("categorySizes")

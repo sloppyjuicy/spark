@@ -21,8 +21,8 @@ import java.io.{File, IOException}
 import java.nio.file.Files
 import java.util.Locale
 
-import scala.collection.JavaConverters._
 import scala.collection.mutable.ArrayBuffer
+import scala.jdk.CollectionConverters._
 
 import org.apache.hadoop.fs.{FileStatus, Path, RawLocalFileSystem}
 import org.apache.hadoop.mapreduce.JobContext
@@ -30,6 +30,7 @@ import org.apache.hadoop.mapreduce.JobContext
 import org.apache.spark.SparkConf
 import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.internal.io.FileCommitProtocol
+import org.apache.spark.paths.SparkPath
 import org.apache.spark.scheduler.{SparkListener, SparkListenerTaskEnd}
 import org.apache.spark.sql.{AnalysisException, DataFrame}
 import org.apache.spark.sql.catalyst.util.stringToFile
@@ -40,6 +41,8 @@ import org.apache.spark.sql.execution.streaming._
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{IntegerType, StructField, StructType}
+import org.apache.spark.tags.SlowSQLTest
+import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.Utils
 
 abstract class FileStreamSinkSuite extends StreamTest {
@@ -47,7 +50,7 @@ abstract class FileStreamSinkSuite extends StreamTest {
 
   override def beforeAll(): Unit = {
     super.beforeAll()
-    spark.sessionState.conf.setConf(SQLConf.ORC_IMPLEMENTATION, "native")
+    spark.conf.set(SQLConf.ORC_IMPLEMENTATION.key, "native")
   }
 
   override def afterAll(): Unit = {
@@ -210,7 +213,7 @@ abstract class FileStreamSinkSuite extends StreamTest {
     // with aggregations using event time windows and watermark, which allows
     // aggregation + append mode.
     val inputData = MemoryStream[Long]
-    val inputDF = inputData.toDF.toDF("time")
+    val inputDF = inputData.toDF().toDF("time")
     val outputDf = inputDF
       .selectExpr("timestamp_seconds(time) AS timestamp")
       .withWatermark("timestamp", "10 seconds")
@@ -273,14 +276,14 @@ abstract class FileStreamSinkSuite extends StreamTest {
     withTempDir { dir =>
 
       def testOutputMode(mode: String): Unit = {
-        val e = intercept[AnalysisException] {
-          df.writeStream.format("parquet").outputMode(mode).start(dir.getCanonicalPath)
-        }
-        Seq(mode, "not support").foreach { w =>
-          assert(e.getMessage.toLowerCase(Locale.ROOT).contains(w))
-        }
+        checkError(
+          exception = intercept[AnalysisException] {
+            df.writeStream.format("parquet").outputMode(mode).start(dir.getCanonicalPath)
+          },
+          condition = "STREAMING_OUTPUT_MODE.UNSUPPORTED_DATASOURCE",
+          sqlState = "42KDE",
+          parameters = Map("className" -> "parquet", "outputMode" -> mode))
       }
-
       testOutputMode("update")
       testOutputMode("complete")
     }
@@ -371,10 +374,12 @@ abstract class FileStreamSinkSuite extends StreamTest {
           }
         }
 
-        val errorMsg = intercept[AnalysisException] {
-          spark.read.schema(s"$c0 INT, $c1 INT").json(outputDir).as[(Int, Int)]
-        }.getMessage
-        assert(errorMsg.contains("Found duplicate column(s) in the data schema: "))
+        checkError(
+          exception = intercept[AnalysisException] {
+            spark.read.schema(s"$c0 INT, $c1 INT").json(outputDir).as[(Int, Int)]
+          },
+          condition = "COLUMN_ALREADY_EXISTS",
+          parameters = Map("columnName" -> s"`${c1.toLowerCase(Locale.ROOT)}`"))
       }
     }
   }
@@ -517,7 +522,7 @@ abstract class FileStreamSinkSuite extends StreamTest {
           .filter(_.toString.endsWith(".parquet"))
           .map(_.getFileName.toString)
           .toSet
-        val trackingFileNames = tracking.map(new Path(_).getName).toSet
+        val trackingFileNames = tracking.map(SparkPath.fromUrlString(_).toPath.getName).toSet
 
         // there would be possible to have race condition:
         // - some tasks complete while abortJob is being called
@@ -567,7 +572,7 @@ abstract class FileStreamSinkSuite extends StreamTest {
           val allFiles = sinkLog.allFiles()
           // only files from non-empty partition should be logged
           assert(allFiles.length < 10)
-          assert(allFiles.forall(file => fs.exists(new Path(file.path))))
+          assert(allFiles.forall(file => fs.exists(file.sparkPath.toPath)))
 
           // the query should be able to read all rows correctly with metadata log
           val outputDf = spark.read.format(format).load(outputDir.getCanonicalPath)
@@ -584,7 +589,7 @@ abstract class FileStreamSinkSuite extends StreamTest {
       "fs.file.impl.disable.cache" -> "true") {
       withTempDir { tempDir =>
         val path = new File(tempDir, "text").getCanonicalPath
-        Seq("foo").toDF.write.format("text").save(path)
+        Seq("foo").toDF().write.format("text").save(path)
         spark.read.format("text").load(path)
       }
     }
@@ -596,7 +601,7 @@ abstract class FileStreamSinkSuite extends StreamTest {
       "fs.file.impl.disable.cache" -> "true") {
       withTempDir { tempDir =>
         val path = new File(tempDir, "text").getCanonicalPath
-        Seq("foo").toDF.write.format("text").save(path)
+        Seq("foo").toDF().write.format("text").save(path)
         spark.read.format("text").load(path + "/*")
       }
     }
@@ -646,6 +651,19 @@ abstract class FileStreamSinkSuite extends StreamTest {
       }
     }
   }
+
+  test("SPARK-48991: Move path initialization into try-catch block") {
+    val logAppender = new LogAppender("Assume no metadata directory.")
+    Seq(null, "", "file:tmp").foreach { path =>
+      withLogAppender(logAppender) {
+        assert(!FileStreamSink.hasMetadata(Seq(path), spark.sessionState.newHadoopConf(), conf))
+      }
+
+      assert(logAppender.loggingEvents.map(_.getMessage.getFormattedMessage).contains(
+        "Assume no metadata directory. Error while looking for metadata directory in the path:" +
+        s" $path."))
+    }
+  }
 }
 
 object PendingCommitFilesTrackingManifestFileCommitProtocol {
@@ -670,6 +688,7 @@ class PendingCommitFilesTrackingManifestFileCommitProtocol(jobId: String, path: 
   }
 }
 
+@SlowSQLTest
 class FileStreamSinkV1Suite extends FileStreamSinkSuite {
   override protected def sparkConf: SparkConf =
     super
@@ -680,7 +699,7 @@ class FileStreamSinkV1Suite extends FileStreamSinkSuite {
     // Verify that MetadataLogFileIndex is being used and the correct partitioning schema has
     // been inferred
     val hadoopdFsRelations = df.queryExecution.analyzed.collect {
-      case LogicalRelation(baseRelation: HadoopFsRelation, _, _, _) => baseRelation
+      case LogicalRelationWithTable(baseRelation: HadoopFsRelation, _) => baseRelation
     }
     assert(hadoopdFsRelations.size === 1)
     assert(hadoopdFsRelations.head.location.isInstanceOf[MetadataLogFileIndex])
@@ -707,19 +726,20 @@ class FileStreamSinkV1Suite extends FileStreamSinkSuite {
     // Read with pruning, should read only files in partition dir id=1
     checkFileScanPartitions(df.filter("id = 1")) { partitions =>
       val filesToBeRead = partitions.flatMap(_.files)
-      assert(filesToBeRead.map(_.filePath).forall(_.contains("/id=1/")))
+      assert(filesToBeRead.map(_.urlEncodedPath).forall(_.contains("/id=1/")))
       assert(filesToBeRead.map(_.partitionValues).distinct.size === 1)
     }
 
     // Read with pruning, should read only files in partition dir id=1 and id=2
     checkFileScanPartitions(df.filter("id in (1,2)")) { partitions =>
       val filesToBeRead = partitions.flatMap(_.files)
-      assert(!filesToBeRead.map(_.filePath).exists(_.contains("/id=3/")))
+      assert(!filesToBeRead.map(_.urlEncodedPath).exists(_.contains("/id=3/")))
       assert(filesToBeRead.map(_.partitionValues).distinct.size === 2)
     }
   }
 }
 
+@SlowSQLTest
 class FileStreamSinkV2Suite extends FileStreamSinkSuite {
   override protected def sparkConf: SparkConf =
     super
@@ -745,7 +765,7 @@ class FileStreamSinkV2Suite extends FileStreamSinkSuite {
       }.headOption.getOrElse {
         fail(s"No FileScan in query\n${df.queryExecution}")
       }
-      func(fileScan.planInputPartitions().map(_.asInstanceOf[FilePartition]))
+      func(fileScan.planInputPartitions().map(_.asInstanceOf[FilePartition]).toImmutableArraySeq)
     }
 
     // Read without pruning

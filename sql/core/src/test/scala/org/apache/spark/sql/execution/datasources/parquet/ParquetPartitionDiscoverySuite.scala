@@ -27,10 +27,11 @@ import com.google.common.io.Files
 import org.apache.hadoop.fs.Path
 import org.apache.parquet.hadoop.ParquetOutputFormat
 
-import org.apache.spark.SparkConf
+import org.apache.spark.{SparkConf, SparkRuntimeException}
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.catalog.ExternalCatalogUtils
+import org.apache.spark.sql.catalyst.types.DataTypeUtils
 import org.apache.spark.sql.catalyst.util.{DateFormatter, DateTimeUtils, TimestampFormatter}
 import org.apache.spark.sql.catalyst.util.DateTimeUtils.localDateTimeToMicros
 import org.apache.spark.sql.execution.datasources._
@@ -38,7 +39,6 @@ import org.apache.spark.sql.execution.datasources.{PartitionPath => Partition}
 import org.apache.spark.sql.execution.datasources.v2.{DataSourceV2Relation, FileTable}
 import org.apache.spark.sql.execution.streaming.MemoryStream
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.internal.SQLConf.TimestampTypes
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
@@ -83,11 +83,21 @@ abstract class ParquetPartitionDiscoverySuite
     check("1.5", DoubleType)
     check("hello", StringType)
     check("1990-02-24", DateType)
-    // The inferred timestmap type is consistent with the value of `SQLConf.TIMESTAMP_TYPE`
-    Seq(TimestampTypes.TIMESTAMP_LTZ, TimestampTypes.TIMESTAMP_NTZ).foreach { tsType =>
-      withSQLConf(SQLConf.TIMESTAMP_TYPE.key -> tsType.toString) {
-        check("1990-02-24 12:00:30", SQLConf.get.timestampType)
-        check("1990-02-24 12:00:30", SQLConf.get.timestampType, ZoneOffset.UTC)
+    // The inferred timestamp type is controlled by `SQLConf.TIMESTAMP_TYPE`
+    val timestampTypes = Seq(
+      SQLConf.TimestampTypes.TIMESTAMP_NTZ.toString,
+      SQLConf.TimestampTypes.TIMESTAMP_LTZ.toString)
+
+    timestampTypes.foreach { timestampType =>
+      withSQLConf(SQLConf.TIMESTAMP_TYPE.key -> timestampType) {
+        val expectedTimestampType =
+          if (timestampType == SQLConf.TimestampTypes.TIMESTAMP_NTZ.toString) {
+            TimestampNTZType
+          } else {
+            TimestampType
+          }
+        check("1990-02-24 12:00:30", expectedTimestampType)
+        check("1990-02-24 12:00:30", expectedTimestampType, ZoneOffset.UTC)
       }
     }
 
@@ -101,8 +111,9 @@ abstract class ParquetPartitionDiscoverySuite
       "hdfs://host:9000/path/a=10/b=20",
       "hdfs://host:9000/path/a=10.5/b=hello")
 
-    var exception = intercept[AssertionError] {
-      parsePartitions(paths.map(new Path(_)), true, Set.empty[Path], None, true, true, timeZoneId)
+    var exception = intercept[SparkRuntimeException] {
+      parsePartitions(
+        paths.map(new Path(_)), true, Set.empty[Path], None, true, true, timeZoneId, false)
     }
     assert(exception.getMessage().contains("Conflicting directory structures detected"))
 
@@ -119,7 +130,8 @@ abstract class ParquetPartitionDiscoverySuite
       None,
       true,
       true,
-      timeZoneId)
+      timeZoneId,
+      false)
 
     // Valid
     paths = Seq(
@@ -135,7 +147,8 @@ abstract class ParquetPartitionDiscoverySuite
       None,
       true,
       true,
-      timeZoneId)
+      timeZoneId,
+      false)
 
     // Valid
     paths = Seq(
@@ -151,7 +164,8 @@ abstract class ParquetPartitionDiscoverySuite
       None,
       true,
       true,
-      timeZoneId)
+      timeZoneId,
+      false)
 
     // Invalid
     paths = Seq(
@@ -159,7 +173,7 @@ abstract class ParquetPartitionDiscoverySuite
       "hdfs://host:9000/path/a=10/b=20",
       "hdfs://host:9000/path/path1")
 
-    exception = intercept[AssertionError] {
+    exception = intercept[SparkRuntimeException] {
       parsePartitions(
         paths.map(new Path(_)),
         true,
@@ -167,7 +181,8 @@ abstract class ParquetPartitionDiscoverySuite
         None,
         true,
         true,
-        timeZoneId)
+        timeZoneId,
+        false)
     }
     assert(exception.getMessage().contains("Conflicting directory structures detected"))
 
@@ -182,7 +197,7 @@ abstract class ParquetPartitionDiscoverySuite
       "hdfs://host:9000/tmp/tables/nonPartitionedTable1",
       "hdfs://host:9000/tmp/tables/nonPartitionedTable2")
 
-    exception = intercept[AssertionError] {
+    exception = intercept[SparkRuntimeException] {
       parsePartitions(
         paths.map(new Path(_)),
         true,
@@ -190,7 +205,8 @@ abstract class ParquetPartitionDiscoverySuite
         None,
         true,
         true,
-        timeZoneId)
+        timeZoneId,
+        false)
     }
     assert(exception.getMessage().contains("Conflicting directory structures detected"))
   }
@@ -286,7 +302,8 @@ abstract class ParquetPartitionDiscoverySuite
           None,
           true,
           true,
-          timeZoneId)
+          timeZoneId,
+          false)
       assert(actualSpec.partitionColumns === spec.partitionColumns)
       assert(actualSpec.partitions.length === spec.partitions.length)
       actualSpec.partitions.zip(spec.partitions).foreach { case (actual, expected) =>
@@ -368,16 +385,21 @@ abstract class ParquetPartitionDiscoverySuite
       s"hdfs://host:9000/path2"),
       PartitionSpec.emptySpec)
 
-    // The inferred timestmap type is consistent with the value of `SQLConf.TIMESTAMP_TYPE`
-    Seq(TimestampTypes.TIMESTAMP_LTZ, TimestampTypes.TIMESTAMP_NTZ).foreach { tsType =>
-      withSQLConf(SQLConf.TIMESTAMP_TYPE.key -> tsType.toString) {
+    // The inferred timestamp type is controlled by `SQLConf.TIMESTAMP_TYPE`
+    val timestampTypes = Seq(
+      SQLConf.TimestampTypes.TIMESTAMP_NTZ.toString,
+      SQLConf.TimestampTypes.TIMESTAMP_LTZ.toString)
+
+    timestampTypes.foreach { timestampType =>
+      withSQLConf(SQLConf.TIMESTAMP_TYPE.key -> timestampType) {
+        val inferTimestampNTZ = timestampType == SQLConf.TimestampTypes.TIMESTAMP_NTZ.toString
         // The cases below check the resolution for type conflicts.
-        val t1 = if (tsType == TimestampTypes.TIMESTAMP_LTZ) {
+        val t1 = if (!inferTimestampNTZ) {
           Timestamp.valueOf("2014-01-01 00:00:00.0").getTime * 1000
         } else {
           localDateTimeToMicros(LocalDateTime.parse("2014-01-01T00:00:00"))
         }
-        val t2 = if (tsType == TimestampTypes.TIMESTAMP_LTZ) {
+        val t2 = if (!inferTimestampNTZ) {
           Timestamp.valueOf("2014-01-01 00:01:00.0").getTime * 1000
         } else {
           localDateTimeToMicros(LocalDateTime.parse("2014-01-01T00:01:00"))
@@ -412,7 +434,7 @@ abstract class ParquetPartitionDiscoverySuite
     def check(paths: Seq[String], spec: PartitionSpec): Unit = {
       val actualSpec =
         parsePartitions(paths.map(new Path(_)), false, Set.empty[Path], None,
-          true, true, timeZoneId)
+          true, true, timeZoneId, false)
       assert(actualSpec === spec)
     }
 
@@ -657,9 +679,15 @@ abstract class ParquetPartitionDiscoverySuite
   }
 
   test("Various partition value types") {
-    Seq(TimestampTypes.TIMESTAMP_LTZ, TimestampTypes.TIMESTAMP_NTZ).foreach { tsType =>
-      withSQLConf(SQLConf.TIMESTAMP_TYPE.key -> tsType.toString) {
-        val ts = if (tsType == TimestampTypes.TIMESTAMP_LTZ) {
+    // The inferred timestamp type is controlled by `SQLConf.TIMESTAMP_TYPE`
+    val timestampTypes = Seq(
+      SQLConf.TimestampTypes.TIMESTAMP_NTZ.toString,
+      SQLConf.TimestampTypes.TIMESTAMP_LTZ.toString)
+
+    timestampTypes.foreach { timestampType =>
+      withSQLConf(SQLConf.TIMESTAMP_TYPE.key -> timestampType) {
+        val inferTimestampNTZ = timestampType == SQLConf.TimestampTypes.TIMESTAMP_NTZ.toString
+        val ts = if (!inferTimestampNTZ) {
           new Timestamp(0)
         } else {
           LocalDateTime.parse("1970-01-01T00:00:00")
@@ -722,9 +750,14 @@ abstract class ParquetPartitionDiscoverySuite
   }
 
   test("Various inferred partition value types") {
-    Seq(TimestampTypes.TIMESTAMP_LTZ, TimestampTypes.TIMESTAMP_NTZ).foreach { tsType =>
-      withSQLConf(SQLConf.TIMESTAMP_TYPE.key -> tsType.toString) {
-        val ts = if (tsType == TimestampTypes.TIMESTAMP_LTZ) {
+    val timestampTypes = Seq(
+      SQLConf.TimestampTypes.TIMESTAMP_NTZ.toString,
+      SQLConf.TimestampTypes.TIMESTAMP_LTZ.toString)
+
+    timestampTypes.foreach { timestampType =>
+      withSQLConf(SQLConf.TIMESTAMP_TYPE.key -> timestampType) {
+        val inferTimestampNTZ = timestampType == SQLConf.TimestampTypes.TIMESTAMP_NTZ.toString
+        val ts = if (!inferTimestampNTZ) {
           Timestamp.valueOf("1990-02-24 12:00:30")
         } else {
           LocalDateTime.parse("1990-02-24T12:00:30")
@@ -845,7 +878,7 @@ abstract class ParquetPartitionDiscoverySuite
 
       checkAnswer(twoPartitionsDF, df.filter("b != 3"))
 
-      intercept[AssertionError] {
+      intercept[SparkRuntimeException] {
         spark
           .read
           .parquet(
@@ -925,61 +958,66 @@ abstract class ParquetPartitionDiscoverySuite
     }
   }
 
-  test("listConflictingPartitionColumns") {
-    def makeExpectedMessage(colNameLists: Seq[String], paths: Seq[String]): String = {
-      val conflictingColNameLists = colNameLists.zipWithIndex.map { case (list, index) =>
-        s"\tPartition column name list #$index: $list"
-      }.mkString("\n", "\n", "\n")
-
-      // scalastyle:off
-      s"""Conflicting partition column names detected:
-         |$conflictingColNameLists
-         |For partitioned table directories, data files should only live in leaf directories.
-         |And directories at the same level should have the same partition column name.
-         |Please check the following directories for unexpected files or inconsistent partition column names:
-         |${paths.map("\t" + _).mkString("\n", "\n", "")}
-       """.stripMargin.trim
-      // scalastyle:on
-    }
-
-    assert(
-      listConflictingPartitionColumns(
+  test("conflictingPartitionColumnsError") {
+    checkError(
+      exception = conflictingPartitionColumnsError(
         Seq(
           (new Path("file:/tmp/foo/a=1"),
             PartitionValues(Seq("a"), Seq(TypedPartValue("1", IntegerType)))),
           (new Path("file:/tmp/foo/b=1"),
-            PartitionValues(Seq("b"), Seq(TypedPartValue("1", IntegerType)))))).trim ===
-        makeExpectedMessage(Seq("a", "b"), Seq("file:/tmp/foo/a=1", "file:/tmp/foo/b=1")))
+            PartitionValues(Seq("b"), Seq(TypedPartValue("1", IntegerType))))
+        )
+      ),
+      condition = "CONFLICTING_PARTITION_COLUMN_NAMES",
+      parameters = Map(
+        "distinctPartColLists" ->
+          "\n\tPartition column name list #0: a\n\tPartition column name list #1: b\n",
+        "suspiciousPaths" -> "\n\tfile:/tmp/foo/a=1\n\tfile:/tmp/foo/b=1"
+      )
+    )
 
-    assert(
-      listConflictingPartitionColumns(
+    checkError(
+      exception = conflictingPartitionColumnsError(
         Seq(
           (new Path("file:/tmp/foo/a=1/_temporary"),
             PartitionValues(Seq("a"), Seq(TypedPartValue("1", IntegerType)))),
           (new Path("file:/tmp/foo/a=1"),
-            PartitionValues(Seq("a"), Seq(TypedPartValue("1", IntegerType)))))).trim ===
-        makeExpectedMessage(
-          Seq("a"),
-          Seq("file:/tmp/foo/a=1/_temporary", "file:/tmp/foo/a=1")))
+            PartitionValues(Seq("a"), Seq(TypedPartValue("1", IntegerType))))
+        )
+      ),
+      condition = "CONFLICTING_PARTITION_COLUMN_NAMES",
+      parameters = Map(
+        "distinctPartColLists" ->
+          "\n\tPartition column name list #0: a\n",
+        "suspiciousPaths" -> "\n\tfile:/tmp/foo/a=1/_temporary\n\tfile:/tmp/foo/a=1"
+      )
+    )
 
-    assert(
-      listConflictingPartitionColumns(
+    checkError(
+      exception = conflictingPartitionColumnsError(
         Seq(
           (new Path("file:/tmp/foo/a=1"),
             PartitionValues(Seq("a"), Seq(TypedPartValue("1", IntegerType)))),
           (new Path("file:/tmp/foo/a=1/b=foo"),
             PartitionValues(Seq("a", "b"),
-              Seq(TypedPartValue("1", IntegerType), TypedPartValue("foo", StringType)))))).trim ===
-        makeExpectedMessage(
-          Seq("a", "a, b"),
-          Seq("file:/tmp/foo/a=1", "file:/tmp/foo/a=1/b=foo")))
+              Seq(TypedPartValue("1", IntegerType), TypedPartValue("foo", StringType))))
+        )
+      ),
+      condition = "CONFLICTING_PARTITION_COLUMN_NAMES",
+      parameters = Map(
+        "distinctPartColLists" ->
+          "\n\tPartition column name list #0: a\n\tPartition column name list #1: a, b\n",
+        "suspiciousPaths" -> "\n\tfile:/tmp/foo/a=1\n\tfile:/tmp/foo/a=1/b=foo"
+      )
+    )
   }
 
   test("Parallel partition discovery") {
     withTempPath { dir =>
       withSQLConf(SQLConf.PARALLEL_PARTITION_DISCOVERY_THRESHOLD.key -> "1") {
         val path = dir.getCanonicalPath
-        val df = spark.range(5).select('id as 'a, 'id as 'b, 'id as 'c).coalesce(1)
+        val df = spark.range(5).select($"id" as Symbol("a"), $"id" as Symbol("b"),
+          $"id" as Symbol("c")).coalesce(1)
         df.write.partitionBy("b", "c").parquet(path)
         checkAnswer(spark.read.parquet(path), df)
       }
@@ -1065,16 +1103,17 @@ abstract class ParquetPartitionDiscoverySuite
     }
   }
 
-  test("SPARK-23436: invalid Dates should be inferred as String in partition inference") {
+  test(
+    "SPARK-23436, SPARK-36861: invalid Dates should be inferred as String in partition inference") {
     withTempPath { path =>
-      val data = Seq(("1", "2018-41", "2018-01-01-04", "test"))
-        .toDF("id", "date_month", "date_hour", "data")
+      val data = Seq(("1", "2018-41", "2018-01-01-04", "2021-01-01T00", "test"))
+        .toDF("id", "date_month", "date_hour", "date_t_hour", "data")
 
-      data.write.partitionBy("date_month", "date_hour").parquet(path.getAbsolutePath)
+      data.write.partitionBy("date_month", "date_hour", "date_t_hour").parquet(path.getAbsolutePath)
       val input = spark.read.parquet(path.getAbsolutePath).select("id",
-        "date_month", "date_hour", "data")
+        "date_month", "date_hour", "date_t_hour", "data")
 
-      assert(input.schema.sameType(input.schema))
+      assert(DataTypeUtils.sameType(data.schema, input.schema))
       checkAnswer(input, data)
     }
   }
@@ -1091,6 +1130,61 @@ abstract class ParquetPartitionDiscoverySuite
       val readback = spark.read.parquet(path)
       assert(readback.schema("part").dataType === StringType)
       checkAnswer(readback, Row(0, "AA") :: Row(1, "-0") :: Nil)
+    }
+  }
+
+  test("SPARK-40212: SparkSQL castPartValue does not properly handle byte, short, float") {
+    withTempDir { dir =>
+      val data = Seq[(Int, Byte, Short, Float)](
+        (1, 2, 3, 4.0f)
+      )
+      data.toDF("a", "b", "c", "d")
+        .write
+        .mode("overwrite")
+        .partitionBy("b", "c", "d")
+        .parquet(dir.getCanonicalPath)
+      val res = spark.read
+        .schema("a INT, b BYTE, c SHORT, d FLOAT")
+        .parquet(dir.getCanonicalPath)
+      checkAnswer(res, Seq(Row(1, 2, 3, 4.0f)))
+    }
+  }
+
+  test("SPARK-49163: Attempt to create table based on broken parquet partition data") {
+    withTempDir { dir =>
+      val data = Seq[(String, String, String)](("a", "b", "c"))
+      data
+        .toDF("col1", "col2", "col3")
+        .write
+        .mode("overwrite")
+        .partitionBy("col1", "col2")
+        .parquet(dir.getCanonicalPath)
+
+      // Structure of parquet table in filesystem:
+      // <base>
+      // +- col1=a
+      //    +- col2=b
+      //       |- part-00000.parquet
+
+      val partition = new File(dir, "col1=a")
+      val dummyData = new File(partition, "dummy")
+      dummyData.createNewFile()
+
+      // Structure of parquet table in filesystem is now corrupt:
+      // <base>
+      // +- col1=a
+      //    |- dummy
+      //    +- col2=b
+      //       |- part-00000.parquet
+
+      val exception = intercept[SparkRuntimeException] {
+        spark.read.parquet(dir.toString)
+      }
+      val msg = exception.getMessage
+      assert(exception.getCondition === "CONFLICTING_PARTITION_COLUMN_NAMES")
+      // Partitions inside the error message can be presented in any order
+      assert("Partition column name list #[0-1]: col1".r.findFirstIn(msg).isDefined)
+      assert("Partition column name list #[0-1]: col1, col2".r.findFirstIn(msg).isDefined)
     }
   }
 }
@@ -1188,8 +1282,8 @@ class ParquetV1PartitionDiscoverySuite extends ParquetPartitionDiscoverySuite {
       (1 to 10).map(i => (i, i.toString)).toDF("a", "b").write.parquet(dir.getCanonicalPath)
       val queryExecution = spark.read.parquet(dir.getCanonicalPath).queryExecution
       queryExecution.analyzed.collectFirst {
-        case LogicalRelation(
-        HadoopFsRelation(location: PartitioningAwareFileIndex, _, _, _, _, _), _, _, _) =>
+        case LogicalRelationWithTable(
+          HadoopFsRelation(location: PartitioningAwareFileIndex, _, _, _, _, _), _) =>
           assert(location.partitionSpec() === PartitionSpec.emptySpec)
       }.getOrElse {
         fail(s"Expecting a matching HadoopFsRelation, but got:\n$queryExecution")
@@ -1255,6 +1349,14 @@ class ParquetV2PartitionDiscoverySuite extends ParquetPartitionDiscoverySuite {
     val schema = new StructType().add("p_int", "int").add("p_float", "float")
     val path = PartitioningUtils.getPathFragment(spec, schema)
     assert("p_int=10/p_float=1.0" === path)
+  }
+
+  test("SPARK-39417: Null partition value") {
+    // null partition value is replaced by DEFAULT_PARTITION_NAME before hitting getPathFragment.
+    val spec = Map("p_int"-> ExternalCatalogUtils.DEFAULT_PARTITION_NAME)
+    val schema = new StructType().add("p_int", "int")
+    val path = PartitioningUtils.getPathFragment(spec, schema)
+    assert(s"p_int=${ExternalCatalogUtils.DEFAULT_PARTITION_NAME}" === path)
   }
 
   test("read partitioned table - partition key included in Parquet file") {
