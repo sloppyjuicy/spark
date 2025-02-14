@@ -17,17 +17,21 @@
 package org.apache.spark.sql.internal
 
 import org.apache.spark.annotation.Unstable
-import org.apache.spark.sql.{ExperimentalMethods, SparkSession, UDFRegistration, _}
-import org.apache.spark.sql.catalyst.analysis.{Analyzer, FunctionRegistry, ReplaceCharWithVarchar, ResolveSessionCatalog, TableFunctionRegistry}
+import org.apache.spark.sql.{DataSourceRegistration, ExperimentalMethods, SparkSessionExtensions, UDTFRegistration}
+import org.apache.spark.sql.artifact.ArtifactManager
+import org.apache.spark.sql.catalyst.analysis.{Analyzer, EvalSubqueriesForTimeTravel, FunctionRegistry, InvokeProcedures, ReplaceCharWithVarchar, ResolveDataSource, ResolveSessionCatalog, ResolveTranspose, TableFunctionRegistry}
+import org.apache.spark.sql.catalyst.analysis.resolver.ResolverExtension
 import org.apache.spark.sql.catalyst.catalog.{FunctionExpressionBuilder, SessionCatalog}
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.optimizer.Optimizer
 import org.apache.spark.sql.catalyst.parser.ParserInterface
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.rules.Rule
+import org.apache.spark.sql.classic.{SparkSession, Strategy, StreamingQueryManager, UDFRegistration}
 import org.apache.spark.sql.connector.catalog.CatalogManager
 import org.apache.spark.sql.errors.QueryCompilationErrors
-import org.apache.spark.sql.execution.{ColumnarRule, CommandExecutionMode, QueryExecution, SparkOptimizer, SparkPlan, SparkPlanner, SparkSqlParser}
+import org.apache.spark.sql.execution.{ColumnarRule, CommandExecutionMode, QueryExecution, SparkOptimizer, SparkPlanner, SparkSqlParser}
+import org.apache.spark.sql.execution.adaptive.AdaptiveRulesHolder
 import org.apache.spark.sql.execution.aggregate.{ResolveEncodersInScalaAgg, ScalaUDAF}
 import org.apache.spark.sql.execution.analysis.DetectAmbiguousSelfJoin
 import org.apache.spark.sql.execution.command.CommandCheck
@@ -35,7 +39,6 @@ import org.apache.spark.sql.execution.datasources._
 import org.apache.spark.sql.execution.datasources.v2.{TableCapabilityCheck, V2SessionCatalog}
 import org.apache.spark.sql.execution.streaming.ResolveWriteToStream
 import org.apache.spark.sql.expressions.UserDefinedAggregateFunction
-import org.apache.spark.sql.streaming.StreamingQueryManager
 import org.apache.spark.sql.util.ExecutionListenerManager
 
 /**
@@ -119,6 +122,13 @@ abstract class BaseSessionStateBuilder(
   }
 
   /**
+   * Manages the registration of data sources
+   */
+  protected lazy val dataSourceManager: DataSourceManager = {
+    parentState.map(_.dataSourceManager.clone()).getOrElse(new DataSourceManager)
+  }
+
+  /**
    * Experimental methods that can be used to define custom optimization rules and custom planning
    * strategies.
    *
@@ -172,7 +182,15 @@ abstract class BaseSessionStateBuilder(
    * Note 1: The user-defined functions must be deterministic.
    * Note 2: This depends on the `functionRegistry` field.
    */
-  protected def udfRegistration: UDFRegistration = new UDFRegistration(functionRegistry)
+  protected def udfRegistration: UDFRegistration = new UDFRegistration(session, functionRegistry)
+
+  protected def udtfRegistration: UDTFRegistration = new UDTFRegistration(tableFunctionRegistry)
+
+  /**
+   * A collection of method used for registering user-defined data sources.
+   */
+  protected def dataSourceRegistration: DataSourceRegistration =
+    new DataSourceRegistration(dataSourceManager)
 
   /**
    * Logical query plan analyzer for resolving unresolved attributes and relations.
@@ -180,20 +198,37 @@ abstract class BaseSessionStateBuilder(
    * Note: this depends on the `conf` and `catalog` fields.
    */
   protected def analyzer: Analyzer = new Analyzer(catalogManager) {
+    override val hintResolutionRules: Seq[Rule[LogicalPlan]] =
+      customHintResolutionRules
+
+    override val singlePassResolverExtensions: Seq[ResolverExtension] = Seq(
+      new DataSourceResolver(session)
+    )
+
+    override val singlePassMetadataResolverExtensions: Seq[ResolverExtension] = Seq(
+      new FileResolver(session)
+    )
+
     override val extendedResolutionRules: Seq[Rule[LogicalPlan]] =
-      new FindDataSourceTable(session) +:
+      new ResolveDataSource(session) +:
+        new FindDataSourceTable(session) +:
         new ResolveSQLOnFile(session) +:
         new FallBackFileSourceV2(session) +:
         ResolveEncodersInScalaAgg +:
-        new ResolveSessionCatalog(catalogManager) +:
+        new ResolveSessionCatalog(this.catalogManager) +:
         ResolveWriteToStream +:
+        new EvalSubqueriesForTimeTravel +:
+        new ResolveTranspose(session) +:
+        new InvokeProcedures(session) +:
         customResolutionRules
 
     override val postHocResolutionRules: Seq[Rule[LogicalPlan]] =
       DetectAmbiguousSelfJoin +:
-        PreprocessTableCreation(session) +:
+        QualifyLocationWithWarehouse(catalog) +:
+        PreprocessTableCreation(catalog) +:
         PreprocessTableInsertion +:
         DataSourceAnalysis +:
+        ApplyCharTypePadding +:
         ReplaceCharWithVarchar +:
         customPostHocResolutionRules
 
@@ -203,6 +238,7 @@ abstract class BaseSessionStateBuilder(
         HiveOnlyCheck +:
         TableCapabilityCheck +:
         CommandCheck +:
+        ViewSyncSchemaToMetaStore +:
         customCheckRules
   }
 
@@ -214,6 +250,13 @@ abstract class BaseSessionStateBuilder(
    */
   protected def customResolutionRules: Seq[Rule[LogicalPlan]] = {
     extensions.buildResolutionRules(session)
+  }
+
+  /**
+   * Custom hint resolution rules to add to the Analyzer.
+   */
+  protected def customHintResolutionRules: Seq[Rule[LogicalPlan]] = {
+    extensions.buildHintResolutionRules(session)
   }
 
   /**
@@ -308,8 +351,16 @@ abstract class BaseSessionStateBuilder(
     extensions.buildColumnarRules(session)
   }
 
-  protected def queryStagePrepRules: Seq[Rule[SparkPlan]] = {
-    extensions.buildQueryStagePrepRules(session)
+  protected def adaptiveRulesHolder: AdaptiveRulesHolder = {
+    new AdaptiveRulesHolder(
+      extensions.buildQueryStagePrepRules(session),
+      extensions.buildRuntimeOptimizerRules(session),
+      extensions.buildQueryStageOptimizerRules(session),
+      extensions.buildQueryPostPlannerStrategyRules(session))
+  }
+
+  protected def planNormalizationRules: Seq[Rule[LogicalPlan]] = {
+    extensions.buildPlanNormalizationRules(session)
   }
 
   /**
@@ -322,7 +373,8 @@ abstract class BaseSessionStateBuilder(
   /**
    * Interface to start and stop streaming queries.
    */
-  protected def streamingQueryManager: StreamingQueryManager = new StreamingQueryManager(session)
+  protected def streamingQueryManager: StreamingQueryManager =
+    new StreamingQueryManager(session, conf)
 
   /**
    * An interface to register custom [[org.apache.spark.sql.util.QueryExecutionListener]]s
@@ -331,8 +383,16 @@ abstract class BaseSessionStateBuilder(
    * This gets cloned from parent if available, otherwise a new instance is created.
    */
   protected def listenerManager: ExecutionListenerManager = {
-    parentState.map(_.listenerManager.clone(session)).getOrElse(
-      new ExecutionListenerManager(session, loadExtensions = true))
+    parentState.map(_.listenerManager.clone(session, conf)).getOrElse(
+      new ExecutionListenerManager(session, conf, loadExtensions = true))
+  }
+
+  /**
+   * Resource manager that handles the storage of artifacts as well as preparing the artifacts for
+   * use.
+   */
+  protected def artifactManager: ArtifactManager = {
+    parentState.map(_.artifactManager.clone(session)).getOrElse(new ArtifactManager(session))
   }
 
   /**
@@ -354,6 +414,9 @@ abstract class BaseSessionStateBuilder(
       functionRegistry,
       tableFunctionRegistry,
       udfRegistration,
+      udtfRegistration,
+      dataSourceManager,
+      dataSourceRegistration,
       () => catalog,
       sqlParser,
       () => analyzer,
@@ -365,7 +428,9 @@ abstract class BaseSessionStateBuilder(
       createQueryExecution,
       createClone,
       columnarRules,
-      queryStagePrepRules)
+      adaptiveRulesHolder,
+      planNormalizationRules,
+      () => artifactManager)
   }
 }
 
@@ -407,7 +472,7 @@ class SparkUDFExpressionBuilder extends FunctionExpressionBuilder {
         udafName = Some(name))
       // Check input argument size
       if (expr.inputTypes.size != input.size) {
-        throw QueryCompilationErrors.invalidFunctionArgumentsError(
+        throw QueryCompilationErrors.wrongNumArgsError(
           name, expr.inputTypes.size.toString, input.size)
       }
       expr

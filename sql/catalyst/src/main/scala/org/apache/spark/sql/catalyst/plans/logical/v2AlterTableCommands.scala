@@ -17,12 +17,15 @@
 
 package org.apache.spark.sql.catalyst.plans.logical
 
-import org.apache.spark.sql.catalyst.analysis.{FieldName, FieldPosition}
+import org.apache.spark.sql.catalyst.analysis.{FieldName, FieldPosition, ResolvedFieldName, UnresolvedException}
 import org.apache.spark.sql.catalyst.catalog.CatalogTypes.TablePartitionSpec
-import org.apache.spark.sql.catalyst.util.TypeUtils
+import org.apache.spark.sql.catalyst.catalog.ClusterBySpec
+import org.apache.spark.sql.catalyst.expressions.{Expression, Unevaluable}
+import org.apache.spark.sql.catalyst.util.{ResolveDefaultColumns, TypeUtils}
 import org.apache.spark.sql.connector.catalog.{TableCatalog, TableChange}
 import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.types.DataType
+import org.apache.spark.util.ArrayImplicits._
 
 /**
  * The base trait for commands that need to alter a v2 table with [[TableChange]]s.
@@ -119,7 +122,8 @@ case class AddColumns(
         col.dataType,
         col.nullable,
         col.comment.orNull,
-        col.position.map(_.position).orNull)
+        col.position.map(_.position).orNull,
+        col.getV2Default)
     }
   }
 
@@ -143,7 +147,8 @@ case class ReplaceColumns(
     // REPLACE COLUMNS deletes all the existing columns and adds new columns specified.
     require(table.resolved)
     val deleteChanges = table.schema.fieldNames.map { name =>
-      TableChange.deleteColumn(Array(name))
+      // REPLACE COLUMN should require column to exist
+      TableChange.deleteColumn(Array(name), false /* ifExists */)
     }
     val addChanges = columnsToAdd.map { col =>
       assert(col.path.isEmpty)
@@ -153,9 +158,10 @@ case class ReplaceColumns(
         col.dataType,
         col.nullable,
         col.comment.orNull,
-        null)
+        null,
+        col.getV2Default)
     }
-    deleteChanges ++ addChanges
+    (deleteChanges ++ addChanges).toImmutableArraySeq
   }
 
   override protected def withNewChildInternal(newChild: LogicalPlan): LogicalPlan =
@@ -167,11 +173,12 @@ case class ReplaceColumns(
  */
 case class DropColumns(
     table: LogicalPlan,
-    columnsToDrop: Seq[FieldName]) extends AlterTableCommand {
+    columnsToDrop: Seq[FieldName],
+    ifExists: Boolean) extends AlterTableCommand {
   override def changes: Seq[TableChange] = {
     columnsToDrop.map { col =>
       require(col.resolved, "FieldName should be resolved before it's converted to TableChange.")
-      TableChange.deleteColumn(col.name.toArray)
+      TableChange.deleteColumn(col.name.toArray, ifExists)
     }
   }
 
@@ -195,36 +202,89 @@ case class RenameColumn(
     copy(table = newChild)
 }
 
+case class AlterColumnSpec(
+    column: FieldName,
+    newDataType: Option[DataType],
+    newNullability: Option[Boolean],
+    newComment: Option[String],
+    newPosition: Option[FieldPosition],
+    newDefaultExpression: Option[String]) extends Expression with Unevaluable {
+
+  override def children: Seq[Expression] = Seq(column) ++ newPosition.toSeq
+  override def nullable: Boolean = false
+  override def dataType: DataType = throw new UnresolvedException("dataType")
+  override protected def withNewChildrenInternal(newChildren: IndexedSeq[Expression]): Expression =
+    copy(column = newChildren(0).asInstanceOf[FieldName])
+}
+
 /**
  * The logical plan of the ALTER TABLE ... ALTER COLUMN command.
  */
-case class AlterColumn(
+case class AlterColumns(
     table: LogicalPlan,
-    column: FieldName,
-    dataType: Option[DataType],
-    nullable: Option[Boolean],
-    comment: Option[String],
-    position: Option[FieldPosition]) extends AlterTableCommand {
+    specs: Seq[AlterColumnSpec]) extends AlterTableCommand {
   override def changes: Seq[TableChange] = {
-    require(column.resolved, "FieldName should be resolved before it's converted to TableChange.")
-    val colName = column.name.toArray
-    val typeChange = dataType.map { newDataType =>
-      TableChange.updateColumnType(colName, newDataType)
+    specs.flatMap { spec =>
+      val column = spec.column
+      require(column.resolved, "FieldName should be resolved before it's converted to TableChange.")
+      val colName = column.name.toArray
+      val typeChange = spec.newDataType.map { newDataType =>
+        TableChange.updateColumnType(colName, newDataType)
+      }
+      val nullabilityChange = spec.newNullability.map { nullable =>
+        TableChange.updateColumnNullability(colName, nullable)
+      }
+      val commentChange = spec.newComment.map { newComment =>
+        TableChange.updateColumnComment(colName, newComment)
+      }
+      val positionChange = spec.newPosition.map { newPosition =>
+        require(newPosition.resolved,
+          "FieldPosition should be resolved before it's converted to TableChange.")
+        TableChange.updateColumnPosition(colName, newPosition.position)
+      }
+      val defaultValueChange = spec.newDefaultExpression.map { newDefaultExpression =>
+        if (newDefaultExpression.nonEmpty) {
+          // SPARK-45075: We call 'ResolveDefaultColumns.analyze' here to make sure that the default
+          // value parses successfully, and return an error otherwise
+          val newDataType = spec.newDataType.getOrElse(
+            column.asInstanceOf[ResolvedFieldName].field.dataType)
+          ResolveDefaultColumns.analyze(column.name.last, newDataType, newDefaultExpression,
+            "ALTER TABLE ALTER COLUMN")
+        }
+        TableChange.updateColumnDefaultValue(colName, newDefaultExpression)
+      }
+      typeChange.toSeq ++ nullabilityChange ++ commentChange ++ positionChange ++ defaultValueChange
     }
-    val nullabilityChange = nullable.map { nullable =>
-      TableChange.updateColumnNullability(colName, nullable)
-    }
-    val commentChange = comment.map { newComment =>
-      TableChange.updateColumnComment(colName, newComment)
-    }
-    val positionChange = position.map { newPosition =>
-      require(newPosition.resolved,
-        "FieldPosition should be resolved before it's converted to TableChange.")
-      TableChange.updateColumnPosition(colName, newPosition.position)
-    }
-    typeChange.toSeq ++ nullabilityChange ++ commentChange ++ positionChange
   }
 
   override protected def withNewChildInternal(newChild: LogicalPlan): LogicalPlan =
     copy(table = newChild)
+}
+
+/**
+ * The logical plan of the following commands:
+ *  - ALTER TABLE ... CLUSTER BY (col1, col2, ...)
+ *  - ALTER TABLE ... CLUSTER BY NONE
+ */
+case class AlterTableClusterBy(
+    table: LogicalPlan, clusterBySpec: Option[ClusterBySpec]) extends AlterTableCommand {
+  override def changes: Seq[TableChange] = {
+    Seq(TableChange.clusterBy(clusterBySpec
+      .map(_.columnNames.toArray) // CLUSTER BY (col1, col2, ...)
+      .getOrElse(Array.empty)))
+  }
+
+  protected def withNewChildInternal(newChild: LogicalPlan): LogicalPlan = copy(table = newChild)
+}
+
+/**
+ * The logical plan of the ALTER TABLE ... DEFAULT COLLATION name command.
+ */
+case class AlterTableCollation(
+    table: LogicalPlan, collation: String) extends AlterTableCommand {
+  override def changes: Seq[TableChange] = {
+    Seq(TableChange.setProperty(TableCatalog.PROP_COLLATION, collation))
+  }
+
+  protected def withNewChildInternal(newChild: LogicalPlan): LogicalPlan = copy(table = newChild)
 }

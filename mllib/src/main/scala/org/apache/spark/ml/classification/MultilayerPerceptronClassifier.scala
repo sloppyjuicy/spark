@@ -22,10 +22,11 @@ import org.apache.hadoop.fs.Path
 import org.apache.spark.annotation.Since
 import org.apache.spark.ml.ann.{FeedForwardTopology, FeedForwardTrainer}
 import org.apache.spark.ml.feature.OneHotEncoderModel
-import org.apache.spark.ml.linalg.Vector
+import org.apache.spark.ml.linalg.{Vector, Vectors}
 import org.apache.spark.ml.param._
 import org.apache.spark.ml.param.shared._
 import org.apache.spark.ml.util._
+import org.apache.spark.ml.util.DatasetUtils._
 import org.apache.spark.ml.util.Instrumentation.instrumented
 import org.apache.spark.sql._
 import org.apache.spark.util.VersionUtils.majorMinorVersion
@@ -192,18 +193,22 @@ class MultilayerPerceptronClassifier @Since("1.5.0") (
     instr.logNumClasses(labels)
     instr.logNumFeatures(myLayers.head)
 
+    val validated = dataset.select(
+      checkClassificationLabels($(labelCol), Some(labels)).as("_validated_label_"),
+      checkNonNanVectors($(featuresCol)).as("_validated_features_")
+    )
+
     // One-hot encoding for labels using OneHotEncoderModel.
     // As we already know the length of encoding, we skip fitting and directly create
     // the model.
     val encodedLabelCol = "_encoded" + $(labelCol)
     val encodeModel = new OneHotEncoderModel(uid, Array(labels))
-      .setInputCols(Array($(labelCol)))
+      .setInputCols(Array("_validated_label_"))
       .setOutputCols(Array(encodedLabelCol))
       .setDropLast(false)
-    val encodedDataset = encodeModel.transform(dataset)
-    val data = encodedDataset.select($(featuresCol), encodedLabelCol).rdd.map {
-      case Row(features: Vector, encodedLabel: Vector) => (features, encodedLabel)
-    }
+    val encodedDataset = encodeModel.transform(validated)
+    val data = encodedDataset.select("_validated_features_", encodedLabelCol)
+      .rdd.map { case Row(features: Vector, encodedLabel: Vector) => (features, encodedLabel) }
     val topology = FeedForwardTopology.multiLayerPerceptron(myLayers, softmaxOnTop = true)
     val trainer = new FeedForwardTrainer(topology, myLayers(0), myLayers.last)
     if (isDefined(initialWeights)) {
@@ -277,6 +282,8 @@ class MultilayerPerceptronClassificationModel private[ml] (
   extends ProbabilisticClassificationModel[Vector, MultilayerPerceptronClassificationModel]
   with MultilayerPerceptronParams with Serializable with MLWritable
   with HasTrainingSummary[MultilayerPerceptronClassificationTrainingSummary]{
+
+  private[ml] def this() = this(Identifiable.randomUID("mlpc"), Vectors.empty)
 
   @Since("1.6.0")
   override lazy val numFeatures: Int = $(layers).head
@@ -360,11 +367,11 @@ object MultilayerPerceptronClassificationModel
 
     override protected def saveImpl(path: String): Unit = {
       // Save metadata and Params
-      DefaultParamsWriter.saveMetadata(instance, path, sc)
+      DefaultParamsWriter.saveMetadata(instance, path, sparkSession)
       // Save model data: weights
       val data = Data(instance.weights)
       val dataPath = new Path(path, "data").toString
-      sparkSession.createDataFrame(Seq(data)).repartition(1).write.parquet(dataPath)
+      sparkSession.createDataFrame(Seq(data)).write.parquet(dataPath)
     }
   }
 
@@ -375,7 +382,7 @@ object MultilayerPerceptronClassificationModel
     private val className = classOf[MultilayerPerceptronClassificationModel].getName
 
     override def load(path: String): MultilayerPerceptronClassificationModel = {
-      val metadata = DefaultParamsReader.loadMetadata(path, sc, className)
+      val metadata = DefaultParamsReader.loadMetadata(path, sparkSession, className)
       val (majorVersion, _) = majorMinorVersion(metadata.sparkVersion)
 
       val dataPath = new Path(path, "data").toString

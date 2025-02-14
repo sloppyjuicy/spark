@@ -221,7 +221,7 @@ class SingleFileEventLogFileReaderSuite extends EventLogFileReadersSuite {
       val entry = is.getNextEntry
       assert(entry != null)
       val actual = new String(ByteStreams.toByteArray(is), StandardCharsets.UTF_8)
-      val expected = Files.toString(new File(logPath.toString), StandardCharsets.UTF_8)
+      val expected = Files.asCharSource(new File(logPath.toString), StandardCharsets.UTF_8).read()
       assert(actual === expected)
       assert(is.getNextEntry === null)
     }
@@ -229,6 +229,37 @@ class SingleFileEventLogFileReaderSuite extends EventLogFileReadersSuite {
 }
 
 class RollingEventLogFilesReaderSuite extends EventLogFileReadersSuite {
+  test("SPARK-46012: appStatus file should exist") {
+    withTempDir { dir =>
+      val appId = getUniqueApplicationId
+      val attemptId = None
+
+      val conf = getLoggingConf(testDirPath)
+      conf.set(EVENT_LOG_ENABLE_ROLLING, true)
+      conf.set(EVENT_LOG_ROLLING_MAX_FILE_SIZE.key, "10m")
+
+      val writer = createWriter(appId, attemptId, testDirPath.toUri, conf,
+        SparkHadoopUtil.get.newConfiguration(conf))
+
+      writer.start()
+      val dummyStr = "dummy" * 1024
+      writeTestEvents(writer, dummyStr, 1024 * 1024 * 20)
+      writer.stop()
+
+      // Verify a healthy rolling event log directory
+      val logPathCompleted = getCurrentLogPath(writer.logPath, isCompleted = true)
+      val readerOpt = EventLogFileReader(fileSystem, new Path(logPathCompleted))
+      assert(readerOpt.get.isInstanceOf[RollingEventLogFilesFileReader])
+      assert(readerOpt.get.listEventLogFiles.length === 3)
+
+      // Make unhealthy rolling event directory by removing appStatus file.
+      val appStatusFile = fileSystem.listStatus(new Path(logPathCompleted))
+        .find(RollingEventLogFilesWriter.isAppStatusFile).get.getPath
+      fileSystem.delete(appStatusFile, false)
+      assert(EventLogFileReader(fileSystem, new Path(logPathCompleted)).isEmpty)
+    }
+  }
+
   allCodecs.foreach { codecShortName =>
     test(s"rolling event log files - codec $codecShortName") {
       val appId = getUniqueApplicationId
@@ -337,8 +368,8 @@ class RollingEventLogFilesReaderSuite extends EventLogFileReadersSuite {
           assert(allFileNames.contains(fileName))
 
           val actual = new String(ByteStreams.toByteArray(is), StandardCharsets.UTF_8)
-          val expected = Files.toString(new File(logPath.toString, fileName),
-            StandardCharsets.UTF_8)
+          val expected = Files.asCharSource(
+            new File(logPath.toString, fileName), StandardCharsets.UTF_8).read()
           assert(actual === expected)
         }
       }

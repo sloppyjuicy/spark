@@ -29,7 +29,7 @@ import org.apache.spark.ml.util._
 import org.apache.spark.sql._
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.StructType
-
+import org.apache.spark.util.ArrayImplicits._
 
 /**
  * Params for [[VarianceThresholdSelector]] and [[VarianceThresholdSelectorModel]].
@@ -56,7 +56,7 @@ private[feature] trait VarianceThresholdSelectorParams extends Params
 
 /**
  * Feature selector that removes all low-variance features. Features with a
- * variance not greater than the threshold will be removed. The default is to keep
+ * (sample) variance not greater than the threshold will be removed. The default is to keep
  * all features with non-zero variance, i.e. remove the features that have the
  * same value in all samples.
  */
@@ -126,6 +126,9 @@ class VarianceThresholdSelectorModel private[ml](
   extends Model[VarianceThresholdSelectorModel] with VarianceThresholdSelectorParams
     with MLWritable {
 
+  private[ml] def this() = this(
+    Identifiable.randomUID("VarianceThresholdSelector"), Array.emptyIntArray)
+
   if (selectedFeatures.length >= 2) {
     require(selectedFeatures.sliding(2).forall(l => l(0) < l(1)),
       "Index should be strictly increasing.")
@@ -187,10 +190,10 @@ object VarianceThresholdSelectorModel extends MLReadable[VarianceThresholdSelect
     private case class Data(selectedFeatures: Seq[Int])
 
     override protected def saveImpl(path: String): Unit = {
-      DefaultParamsWriter.saveMetadata(instance, path, sc)
-      val data = Data(instance.selectedFeatures.toSeq)
+      DefaultParamsWriter.saveMetadata(instance, path, sparkSession)
+      val data = Data(instance.selectedFeatures.toImmutableArraySeq)
       val dataPath = new Path(path, "data").toString
-      sparkSession.createDataFrame(Seq(data)).repartition(1).write.parquet(dataPath)
+      sparkSession.createDataFrame(Seq(data)).write.parquet(dataPath)
     }
   }
 
@@ -201,7 +204,7 @@ object VarianceThresholdSelectorModel extends MLReadable[VarianceThresholdSelect
     private val className = classOf[VarianceThresholdSelectorModel].getName
 
     override def load(path: String): VarianceThresholdSelectorModel = {
-      val metadata = DefaultParamsReader.loadMetadata(path, sc, className)
+      val metadata = DefaultParamsReader.loadMetadata(path, sparkSession, className)
       val dataPath = new Path(path, "data").toString
       val data = sparkSession.read.parquet(dataPath)
         .select("selectedFeatures").head()

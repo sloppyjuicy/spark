@@ -22,6 +22,7 @@ import org.apache.spark.sql.Row
 import org.apache.spark.sql.catalyst.{CatalystTypeConverters, InternalRow}
 import org.apache.spark.sql.catalyst.expressions.{Attribute, NamedExpression, SortOrder}
 import org.apache.spark.sql.catalyst.plans.physical.Partitioning
+import org.apache.spark.sql.catalyst.types.DataTypeUtils
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
 import org.apache.spark.sql.execution.columnar.InMemoryTableScanExec
 import org.apache.spark.sql.types.StructType
@@ -42,7 +43,7 @@ case class CollectMetricsExec(
   }
 
   val metricsSchema: StructType = {
-    StructType.fromAttributes(metricExpressions.map(_.toAttribute))
+    DataTypeUtils.fromAttributes(metricExpressions.map(_.toAttribute))
   }
 
   // This is not used very frequently (once a query); it is not useful to use code generation here.
@@ -59,9 +60,13 @@ case class CollectMetricsExec(
 
   override def outputOrdering: Seq[SortOrder] = child.outputOrdering
 
+  override def resetMetrics(): Unit = {
+    accumulator.reset()
+    super.resetMetrics()
+  }
+
   override protected def doExecute(): RDD[InternalRow] = {
     val collector = accumulator
-    collector.reset()
     child.execute().mapPartitions { rows =>
       // Only publish the value of the accumulator when the task has completed. This is done by
       // updating a task local accumulator ('updater') which will be merged with the actual

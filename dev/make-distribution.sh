@@ -35,6 +35,7 @@ DISTDIR="$SPARK_HOME/dist"
 MAKE_TGZ=false
 MAKE_PIP=false
 MAKE_R=false
+MAKE_SPARK_CONNECT=false
 NAME=none
 MVN="$SPARK_HOME/build/mvn"
 
@@ -43,9 +44,10 @@ function exit_with_usage {
   echo "make-distribution.sh - tool for making binary distributions of Spark"
   echo ""
   echo "usage:"
-  cl_options="[--name] [--tgz] [--pip] [--r] [--mvn <mvn-command>]"
+  cl_options="[--name] [--tgz] [--pip] [--r] [--connect] [--mvn <mvn-command>]"
   echo "make-distribution.sh $cl_options <maven build options>"
   echo "See Spark's \"Building Spark\" doc for correct Maven options."
+  echo "SparkR is deprecated from Apache Spark 4.0.0 and will be removed in a future version."
   echo ""
   exit 1
 }
@@ -61,6 +63,9 @@ while (( "$#" )); do
       ;;
     --r)
       MAKE_R=true
+      ;;
+    --connect)
+      MAKE_SPARK_CONNECT=true
       ;;
     --mvn)
       MVN="$2"
@@ -141,7 +146,7 @@ SPARK_HADOOP_VERSION=$("$MVN" help:evaluate -Dexpression=hadoop.version $@ \
 SPARK_HIVE=$("$MVN" help:evaluate -Dexpression=project.activeProfiles -pl sql/hive $@ \
     | grep -v "INFO"\
     | grep -v "WARNING"\
-    | fgrep --count "<id>hive</id>";\
+    | grep -F --count "<id>hive</id>";\
     # Reset exit status to 0, otherwise the script stops here if the last grep finds nothing\
     # because we use "set -o pipefail"
     echo -n)
@@ -161,12 +166,18 @@ fi
 # Build uber fat JAR
 cd "$SPARK_HOME"
 
-export MAVEN_OPTS="${MAVEN_OPTS:--Xmx2g -XX:ReservedCodeCacheSize=1g}"
+export MAVEN_OPTS="${MAVEN_OPTS:--Xss128m -Xmx4g -XX:ReservedCodeCacheSize=128m}"
 
 # Store the command as an array because $MVN variable might have spaces in it.
 # Normal quoting tricks don't work.
 # See: http://mywiki.wooledge.org/BashFAQ/050
-BUILD_COMMAND=("$MVN" clean package -DskipTests $@)
+BUILD_COMMAND=("$MVN" clean package \
+    -DskipTests \
+    -Dmaven.javadoc.skip=true \
+    -Dmaven.scaladoc.skip=true \
+    -Dmaven.source.skip \
+    -Dcyclonedx.skip=true \
+    $@)
 
 # Actually build the jar
 echo -e "\nBuilding with..."
@@ -181,7 +192,15 @@ echo "Spark $VERSION$GITREVSTRING built for Hadoop $SPARK_HADOOP_VERSION" > "$DI
 echo "Build flags: $@" >> "$DISTDIR/RELEASE"
 
 # Copy jars
-cp "$SPARK_HOME"/assembly/target/scala*/jars/* "$DISTDIR/jars/"
+cp -r "$SPARK_HOME"/assembly/target/scala*/jars/* "$DISTDIR/jars/"
+
+# Only create the hive-jackson directory if they exist.
+if [ -f "$DISTDIR"/jars/jackson-core-asl-1.9.13.jar ]; then
+  for f in "$DISTDIR"/jars/jackson-*-asl-*.jar; do
+    mkdir -p "$DISTDIR"/hive-jackson
+    mv $f "$DISTDIR"/hive-jackson/
+  done
+fi
 
 # Only create the yarn directory if the yarn artifacts were built.
 if [ -f "$SPARK_HOME"/common/network-yarn/target/scala*/spark-*-yarn-shuffle.jar ]; then
@@ -234,7 +253,8 @@ if [ "$MAKE_PIP" == "true" ]; then
   pushd "$SPARK_HOME/python" > /dev/null
   # Delete the egg info file if it exists, this can cache older setup files.
   rm -rf pyspark.egg-info || echo "No existing egg info file, skipping deletion"
-  python3 setup.py sdist
+  python3 packaging/classic/setup.py sdist
+  python3 packaging/connect/setup.py sdist
   popd > /dev/null
 else
   echo "Skipping building python distribution package"
@@ -287,6 +307,26 @@ if [ "$MAKE_TGZ" == "true" ]; then
   TARDIR="$SPARK_HOME/$TARDIR_NAME"
   rm -rf "$TARDIR"
   cp -r "$DISTDIR" "$TARDIR"
-  tar czf "spark-$VERSION-bin-$NAME.tgz" -C "$SPARK_HOME" "$TARDIR_NAME"
+  TAR="tar"
+  if [ "$(uname -s)" = "Darwin" ]; then
+    TAR="tar --no-mac-metadata --no-xattrs --no-fflags"
+  fi
+  $TAR -czf "spark-$VERSION-bin-$NAME.tgz" -C "$SPARK_HOME" "$TARDIR_NAME"
   rm -rf "$TARDIR"
+  if [[ "$MAKE_SPARK_CONNECT" == "true" ]]; then
+    TARDIR_NAME=spark-$VERSION-bin-$NAME-spark-connect
+    TARDIR="$SPARK_HOME/$TARDIR_NAME"
+    rm -rf "$TARDIR"
+    cp -r "$DISTDIR" "$TARDIR"
+    # Set the Spark Connect system variable in these scripts to enable it by default.
+    awk 'NR==1{print; print "export SPARK_CONNECT_MODE=1"; next} {print}' "$TARDIR/bin/pyspark" > tmp && cat tmp > "$TARDIR/bin/pyspark"
+    awk 'NR==1{print; print "export SPARK_CONNECT_MODE=1"; next} {print}' "$TARDIR/bin/spark-shell" > tmp && cat tmp > "$TARDIR/bin/spark-shell"
+    awk 'NR==1{print; print "export SPARK_CONNECT_MODE=1"; next} {print}' "$TARDIR/bin/spark-submit" > tmp && cat tmp > "$TARDIR/bin/spark-submit"
+    awk 'NR==1{print; print "set SPARK_CONNECT_MODE=1"; next} {print}' "$TARDIR/bin/pyspark2.cmd" > tmp && cat tmp > "$TARDIR/bin/pyspark2.cmd"
+    awk 'NR==1{print; print "set SPARK_CONNECT_MODE=1"; next} {print}' "$TARDIR/bin/spark-shell2.cmd" > tmp && cat tmp > "$TARDIR/bin/spark-shell2.cmd"
+    awk 'NR==1{print; print "set SPARK_CONNECT_MODE=1"; next} {print}' "$TARDIR/bin/spark-submit2.cmd" > tmp && cat tmp > "$TARDIR/bin/spark-submit2.cmd"
+    rm tmp
+    $TAR -czf "$TARDIR_NAME.tgz" -C "$SPARK_HOME" "$TARDIR_NAME"
+    rm -rf "$TARDIR"
+  fi
 fi

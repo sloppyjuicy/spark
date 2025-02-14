@@ -20,10 +20,10 @@ package org.apache.spark.sql.execution.datasources.orc
 import org.apache.hadoop.io._
 import org.apache.orc.mapred.{OrcList, OrcMap, OrcStruct, OrcTimestamp}
 
+import org.apache.spark.SparkException
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.SpecializedGetters
 import org.apache.spark.sql.catalyst.util._
-import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.types._
 
 /**
@@ -98,7 +98,7 @@ class OrcSerializer(dataSchema: StructType) {
       }
 
 
-    case LongType | _: DayTimeIntervalType =>
+    case LongType | _: DayTimeIntervalType | _: TimestampNTZType =>
       if (reuseObj) {
         val result = new LongWritable()
         (getter, ordinal) =>
@@ -130,7 +130,7 @@ class OrcSerializer(dataSchema: StructType) {
 
 
     // Don't reuse the result object for string and binary as it would cause extra data copy.
-    case StringType => (getter, ordinal) =>
+    case _: StringType => (getter, ordinal) =>
       new Text(getter.getUTF8String(ordinal).getBytes)
 
     case BinaryType => (getter, ordinal) =>
@@ -147,14 +147,12 @@ class OrcSerializer(dataSchema: StructType) {
       result.setNanos(ts.getNanos)
       result
 
-    case TimestampNTZType => (getter, ordinal) => OrcUtils.toOrcNTZ(getter.getLong(ordinal))
-
     case DecimalType.Fixed(precision, scale) =>
       OrcShimUtils.getHiveDecimalWritable(precision, scale)
 
     case st: StructType => (getter, ordinal) =>
       val result = createOrcValue(st).asInstanceOf[OrcStruct]
-      val fieldConverters = st.map(_.dataType).map(newConverter(_))
+      val fieldConverters = st.map(_.dataType).map(newConverter(_)).toArray
       val numFields = st.length
       val struct = getter.getStruct(ordinal, numFields)
       var i = 0
@@ -207,8 +205,7 @@ class OrcSerializer(dataSchema: StructType) {
 
     case udt: UserDefinedType[_] => newConverter(udt.sqlType)
 
-    case _ =>
-      throw QueryExecutionErrors.dataTypeUnsupportedYetError(dataType)
+    case _ => throw SparkException.internalError(s"Unsupported data type $dataType.")
   }
 
   /**

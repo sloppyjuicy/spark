@@ -24,12 +24,15 @@ import scala.util.control.NonFatal
 import org.apache.hadoop.hive.ql.exec.{UDAF, UDF}
 import org.apache.hadoop.hive.ql.udf.generic.{AbstractGenericUDAFResolver, GenericUDF, GenericUDTF}
 
-import org.apache.spark.sql._
-import org.apache.spark.sql.catalyst.analysis.{Analyzer, ReplaceCharWithVarchar, ResolveSessionCatalog}
+import org.apache.spark.sql.AnalysisException
+import org.apache.spark.sql.catalyst.analysis.{Analyzer, EvalSubqueriesForTimeTravel, InvokeProcedures, ReplaceCharWithVarchar, ResolveDataSource, ResolveSessionCatalog, ResolveTranspose}
+import org.apache.spark.sql.catalyst.analysis.resolver.ResolverExtension
 import org.apache.spark.sql.catalyst.catalog.{ExternalCatalogWithListener, InvalidUDFClassException}
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.rules.Rule
+import org.apache.spark.sql.classic.{SparkSession, Strategy}
+import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.execution.SparkPlanner
 import org.apache.spark.sql.execution.aggregate.ResolveEncodersInScalaAgg
 import org.apache.spark.sql.execution.analysis.DetectAmbiguousSelfJoin
@@ -83,23 +86,37 @@ class HiveSessionStateBuilder(
    * A logical query plan `Analyzer` with rules specific to Hive.
    */
   override protected def analyzer: Analyzer = new Analyzer(catalogManager) {
+    override val singlePassResolverExtensions: Seq[ResolverExtension] = Seq(
+      new DataSourceWithHiveResolver(session, catalog)
+    )
+
+    override val singlePassMetadataResolverExtensions: Seq[ResolverExtension] = Seq(
+      new FileResolver(session)
+    )
+
     override val extendedResolutionRules: Seq[Rule[LogicalPlan]] =
       new ResolveHiveSerdeTable(session) +:
+        new ResolveDataSource(session) +:
         new FindDataSourceTable(session) +:
         new ResolveSQLOnFile(session) +:
         new FallBackFileSourceV2(session) +:
         ResolveEncodersInScalaAgg +:
         new ResolveSessionCatalog(catalogManager) +:
         ResolveWriteToStream +:
+        new EvalSubqueriesForTimeTravel +:
+        new DetermineTableStats(session) +:
+        new ResolveTranspose(session) +:
+        new InvokeProcedures(session) +:
         customResolutionRules
 
     override val postHocResolutionRules: Seq[Rule[LogicalPlan]] =
       DetectAmbiguousSelfJoin +:
-        new DetermineTableStats(session) +:
         RelationConversions(catalog) +:
-        PreprocessTableCreation(session) +:
+        QualifyLocationWithWarehouse(catalog) +:
+        PreprocessTableCreation(catalog) +:
         PreprocessTableInsertion +:
         DataSourceAnalysis +:
+        ApplyCharTypePadding +:
         HiveAnalysis +:
         ReplaceCharWithVarchar +:
         customPostHocResolutionRules
@@ -109,6 +126,7 @@ class HiveSessionStateBuilder(
         PreReadCheck +:
         TableCapabilityCheck +:
         CommandCheck +:
+        ViewSyncSchemaToMetaStore +:
         customCheckRules
   }
 
@@ -120,7 +138,7 @@ class HiveSessionStateBuilder(
    */
   override protected def planner: SparkPlanner = {
     new SparkPlanner(session, experimentalMethods) with HiveStrategies {
-      override val sparkSession: SparkSession = session
+      override val sparkSession: SparkSession = this.session
 
       override def extraPlanningStrategies: Seq[Strategy] =
         super.extraPlanningStrategies ++ customPlanningStrategies ++
@@ -198,14 +216,16 @@ object HiveUDFExpressionBuilder extends SparkUDFExpressionBuilder {
           case i: InvocationTargetException => i.getCause
           case o => o
         }
-        val errorMsg = s"No handler for UDF/UDAF/UDTF '${clazz.getCanonicalName}': $e"
-        val analysisException = new AnalysisException(errorMsg)
+        val analysisException = new AnalysisException(
+          errorClass = "_LEGACY_ERROR_TEMP_3084",
+          messageParameters = Map(
+            "clazz" -> clazz.getCanonicalName,
+            "e" -> e.toString))
         analysisException.setStackTrace(e.getStackTrace)
         throw analysisException
     }
     udfExpr.getOrElse {
-      throw new InvalidUDFClassException(
-        s"No handler for UDF/UDAF/UDTF '${clazz.getCanonicalName}'")
+      throw QueryCompilationErrors.invalidUDFClassError(clazz.getCanonicalName)
     }
   }
 }

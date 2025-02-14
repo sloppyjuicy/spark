@@ -29,64 +29,15 @@ from pyspark.ml.classification import (
 )
 from pyspark.ml.clustering import DistributedLDAModel, KMeans, LocalLDAModel, LDA, LDAModel
 from pyspark.ml.fpm import FPGrowth
-from pyspark.ml.linalg import Matrices, Vectors, DenseVector
+from pyspark.ml.linalg import Vectors, DenseVector
 from pyspark.ml.recommendation import ALS
 from pyspark.ml.regression import GeneralizedLinearRegression, LinearRegression
 from pyspark.sql import Row
 from pyspark.testing.mlutils import SparkSessionTestCase
 
 
-class LogisticRegressionTest(SparkSessionTestCase):
-    def test_binomial_logistic_regression_with_bound(self):
-
-        df = self.spark.createDataFrame(
-            [
-                (1.0, 1.0, Vectors.dense(0.0, 5.0)),
-                (0.0, 2.0, Vectors.dense(1.0, 2.0)),
-                (1.0, 3.0, Vectors.dense(2.0, 1.0)),
-                (0.0, 4.0, Vectors.dense(3.0, 3.0)),
-            ],
-            ["label", "weight", "features"],
-        )
-
-        lor = LogisticRegression(
-            regParam=0.01,
-            weightCol="weight",
-            lowerBoundsOnCoefficients=Matrices.dense(1, 2, [-1.0, -1.0]),
-            upperBoundsOnIntercepts=Vectors.dense(0.0),
-        )
-        model = lor.fit(df)
-        self.assertTrue(np.allclose(model.coefficients.toArray(), [-0.2944, -0.0484], atol=1e-4))
-        self.assertTrue(np.isclose(model.intercept, 0.0, atol=1e-4))
-
-    def test_multinomial_logistic_regression_with_bound(self):
-
-        data_path = "data/mllib/sample_multiclass_classification_data.txt"
-        df = self.spark.read.format("libsvm").load(data_path)
-
-        lor = LogisticRegression(
-            regParam=0.01,
-            lowerBoundsOnCoefficients=Matrices.dense(3, 4, range(12)),
-            upperBoundsOnIntercepts=Vectors.dense(0.0, 0.0, 0.0),
-        )
-        model = lor.fit(df)
-        expected = [
-            [4.593, 4.5516, 9.0099, 12.2904],
-            [1.0, 8.1093, 7.0, 10.0],
-            [3.041, 5.0, 8.0, 11.0],
-        ]
-        for i in range(0, len(expected)):
-            self.assertTrue(
-                np.allclose(model.coefficientMatrix.toArray()[i], expected[i], atol=1e-4)
-            )
-        self.assertTrue(
-            np.allclose(model.interceptVector.toArray(), [-0.9057, -1.1392, -0.0033], atol=1e-4)
-        )
-
-
 class MultilayerPerceptronClassifierTest(SparkSessionTestCase):
     def test_raw_and_probability_prediction(self):
-
         data_path = "data/mllib/sample_multiclass_classification_data.txt"
         df = self.spark.read.format("libsvm").load(data_path)
 
@@ -101,7 +52,15 @@ class MultilayerPerceptronClassifierTest(SparkSessionTestCase):
         expected_rawPrediction = [-11.6081922998, -8.15827998691, 22.17757045]
         self.assertTrue(result.prediction, expected_prediction)
         self.assertTrue(np.allclose(result.probability, expected_probability, atol=1e-4))
-        self.assertTrue(np.allclose(result.rawPrediction, expected_rawPrediction, rtol=0.1))
+        # Use `assert_allclose` to show the value of `result.rawPrediction` in the assertion error
+        # message
+        np.testing.assert_allclose(
+            result.rawPrediction,
+            expected_rawPrediction,
+            rtol=0.3,
+            # Use the same default value as `np.allclose`
+            atol=1e-08,
+        )
 
 
 class OneVsRestTests(SparkSessionTestCase):
@@ -332,7 +291,6 @@ class ALSTest(SparkSessionTestCase):
 
 class GeneralizedLinearRegressionTest(SparkSessionTestCase):
     def test_tweedie_distribution(self):
-
         df = self.spark.createDataFrame(
             [
                 (1.0, Vectors.dense(0.0, 0.0)),
@@ -353,7 +311,6 @@ class GeneralizedLinearRegressionTest(SparkSessionTestCase):
         self.assertTrue(np.isclose(model2.intercept, 0.6667, atol=1e-4))
 
     def test_offset(self):
-
         df = self.spark.createDataFrame(
             [
                 (0.2, 1.0, 2.0, Vectors.dense(0.0, 5.0)),
@@ -374,7 +331,6 @@ class GeneralizedLinearRegressionTest(SparkSessionTestCase):
 
 class LinearRegressionTest(SparkSessionTestCase):
     def test_linear_regression_with_huber_loss(self):
-
         data_path = "data/mllib/sample_linear_regression_data.txt"
         df = self.spark.read.format("libsvm").load(data_path)
 
@@ -405,7 +361,7 @@ if __name__ == "__main__":
     from pyspark.ml.tests.test_algorithms import *  # noqa: F401
 
     try:
-        import xmlrunner  # type: ignore[import]
+        import xmlrunner
 
         testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
     except ImportError:

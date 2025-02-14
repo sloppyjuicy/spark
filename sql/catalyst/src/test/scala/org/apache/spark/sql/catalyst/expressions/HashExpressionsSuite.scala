@@ -29,11 +29,12 @@ import org.scalatest.exceptions.TestFailedException
 import org.apache.spark.SparkFunSuite
 import org.apache.spark.sql.{RandomDataGenerator, Row}
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.encoders.{ExamplePointUDT, RowEncoder}
+import org.apache.spark.sql.catalyst.encoders.{ExamplePointUDT, ExpressionEncoder}
 import org.apache.spark.sql.catalyst.expressions.codegen.GenerateMutableProjection
-import org.apache.spark.sql.catalyst.util.{ArrayBasedMapData, DateTimeUtils, GenericArrayData, IntervalUtils}
+import org.apache.spark.sql.catalyst.util.{ArrayBasedMapData, CollationFactory, DateTimeUtils, GenericArrayData, IntervalUtils}
 import org.apache.spark.sql.types.{ArrayType, StructType, _}
 import org.apache.spark.unsafe.types.UTF8String
+import org.apache.spark.util.ArrayImplicits._
 
 class HashExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
   val random = new scala.util.Random
@@ -619,11 +620,35 @@ class HashExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     checkHiveHashForDecimal("123456.123456789012345678901234567890", 38, 31, 1728235666)
   }
 
+  for (collation <- Seq("UTF8_LCASE", "UNICODE_CI", "UTF8_BINARY")) {
+    test(s"hash check for collated $collation strings") {
+      val s1 = "aaa"
+      val s2 = "AAA"
+
+      val murmur3Hash1 = Murmur3Hash(Seq(Collate(Literal(s1), ResolvedCollation(collation))), 42)
+      val murmur3Hash2 = Murmur3Hash(Seq(Collate(Literal(s2), ResolvedCollation(collation))), 42)
+
+      // Interpreted hash values for s1 and s2
+      val interpretedHash1 = murmur3Hash1.eval()
+      val interpretedHash2 = murmur3Hash2.eval()
+
+      // Check that interpreted and codegen hashes are equal
+      checkEvaluation(murmur3Hash1, interpretedHash1)
+      checkEvaluation(murmur3Hash2, interpretedHash2)
+
+      if (CollationFactory.fetchCollation(collation).isUtf8BinaryType) {
+        assert(interpretedHash1 != interpretedHash2)
+      } else {
+        assert(interpretedHash1 == interpretedHash2)
+      }
+    }
+  }
+
   test("SPARK-18207: Compute hash for a lot of expressions") {
     def checkResult(schema: StructType, input: InternalRow): Unit = {
       val exprs = schema.fields.zipWithIndex.map { case (f, i) =>
         BoundReference(i, f.dataType, true)
-      }
+      }.toImmutableArraySeq
       val murmur3HashExpr = Murmur3Hash(exprs, 42)
       val murmur3HashPlan = GenerateMutableProjection.generate(Seq(murmur3HashExpr))
       val murmursHashEval = Murmur3Hash(exprs, 42).eval(input)
@@ -672,7 +697,7 @@ class HashExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
       (0 until O).map(_ => StructField("structOfStructOfStructOfString", outer)).toArray)
     val exprs = schema.fields.zipWithIndex.map { case (f, i) =>
       BoundReference(i, f.dataType, true)
-    }
+    }.toImmutableArraySeq
     val murmur3HashExpr = Murmur3Hash(exprs, 42)
     val murmur3HashPlan = GenerateMutableProjection.generate(Seq(murmur3HashExpr))
 
@@ -731,7 +756,7 @@ class HashExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
 
   private def testHash(inputSchema: StructType): Unit = {
     val inputGenerator = RandomDataGenerator.forType(inputSchema, nullable = false).get
-    val toRow = RowEncoder(inputSchema).createSerializer()
+    val toRow = ExpressionEncoder(inputSchema).createSerializer()
     val seed = scala.util.Random.nextInt()
     test(s"murmur3/xxHash64/hive hash: ${inputSchema.simpleString}") {
       for (_ <- 1 to 10) {

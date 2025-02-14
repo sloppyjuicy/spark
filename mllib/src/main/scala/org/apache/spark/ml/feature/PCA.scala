@@ -127,6 +127,11 @@ class PCAModel private[ml] (
 
   import PCAModel._
 
+  // For ml connect only
+  @Since("4.0.0")
+  private[ml] def this() = this(Identifiable.randomUID("pca"),
+    DenseMatrix.zeros(1, 1), Vectors.empty)
+
   /** @group setParam */
   @Since("1.5.0")
   def setInputCol(value: String): this.type = set(inputCol, value)
@@ -184,10 +189,10 @@ object PCAModel extends MLReadable[PCAModel] {
     private case class Data(pc: DenseMatrix, explainedVariance: DenseVector)
 
     override protected def saveImpl(path: String): Unit = {
-      DefaultParamsWriter.saveMetadata(instance, path, sc)
+      DefaultParamsWriter.saveMetadata(instance, path, sparkSession)
       val data = Data(instance.pc, instance.explainedVariance)
       val dataPath = new Path(path, "data").toString
-      sparkSession.createDataFrame(Seq(data)).repartition(1).write.parquet(dataPath)
+      sparkSession.createDataFrame(Seq(data)).write.parquet(dataPath)
     }
   }
 
@@ -205,7 +210,7 @@ object PCAModel extends MLReadable[PCAModel] {
      * @return a [[PCAModel]]
      */
     override def load(path: String): PCAModel = {
-      val metadata = DefaultParamsReader.loadMetadata(path, sc, className)
+      val metadata = DefaultParamsReader.loadMetadata(path, sparkSession, className)
 
       val dataPath = new Path(path, "data").toString
       val model = if (majorVersion(metadata.sparkVersion) >= 2) {
